@@ -1,0 +1,37 @@
+name: tf3
+channels:
+  - nvidia
+  - pytorch
+  - conda-forge
+  - comet_ml
+  - defaults
+dependencies:
+  - autopep8
+  - comet_ml
+  - einops
+  - ipykernel
+  - ipython
+  - matplotlib
+  - monai==1.4.0
+  - nibabel
+  - opencv
+  - pandas
+  - panel=0.14
+  - pip
+  - python=3.10.11
+  - pytorch-cuda>=11.7,<11.9
+  - pytorch>=2.1,<=2.2
+  - pyvista==0.38.1
+  - torchmetrics
+  - torchvision
+  - yaml
+  - pyyaml
+  - numpy
+  - scipy
+  - scikit-image
+  - scikit-learn
+  - seaborn
+  - transformers
+  - jupyter
+  - pip:
+    - simpleitk==2.3.1
