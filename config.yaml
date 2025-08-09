@@ -12,11 +12,11 @@ general:
 # Experiment & Logging Settings
 # --------------------------------------------------
 args:
-  comet: True
+  comet: False
   print_config: False
   tags: null
-  is_log_image: True
-  is_log_3d: True
+  is_log_qualitative_2d: True
+  is_log_qualitative_3d: False
   validation_interval: 20
   log_batch_interval: 10
   log_metrics_interval: 10
@@ -38,34 +38,38 @@ args:
   pin_memory: False
 
 # --------------------------------------------------
-# Data & Preprocessing
+# Data & Preprocessing & Augmentation
 # --------------------------------------------------
   data: data
   cache_dir: data/cache
   clear_cache: False
+  val_items: 10
   use_json_split: True
-  use_random_sampler: False
+  sampler_type: weighted #weighted, random, sequential
+  use_thread_loader: True
+  use_persistent_dataset: True
   keys: 
     - image
     - label
   patch_size: 
-    - 128
-    - 128
-    - 128
-  spatial_crop_size: 
-    - 224
-    - 192
-    - 160
-  spatial_crop_margin:
-    - 32
-    - 32
-    - 32
+    - 304
+    - 304
+    - 176
+  # spatial_crop_size: 
+  #   - 224
+  #   - 192
+  #   - 160
+  # spatial_crop_margin:
+  #   - 32
+  #   - 32
+  #   - 32
   crop_foreground: True
   crop_samples: 2
   pixdim: 0.4
-  houndsfield_clip: 5000    
+  houndsfield_clip: 3000    
   z_score_norm: False  
   rotation_range: 0.1
+  lazy_interpolation: True
 
 # --------------------------------------------------
 # Model Architecture
@@ -73,6 +77,8 @@ args:
   n_features: 32
   unet_depth: 5
   norm: instance
+  activation: relu
+  backbone_name: resnet34 #Options: resnet18, resnet34, resnet50
   classes: 33
 
 # --------------------------------------------------
@@ -96,8 +102,8 @@ args:
 # --------------------------------------------------
 # Scheduler Settings
 # --------------------------------------------------
-  scheduler_name: cosine_annealing
-  warmup_steps: 0
+  scheduler_name: warmup_cosine #Options: cosine_annealing, warmup_cosine, warmup_cosine_restarts
+  warmup_steps: 10
   first_cycle_steps: 1.0    
   scheduler_gamma: 0.5
   min_lr: 1.0e-6
@@ -109,7 +115,7 @@ args:
   classification_loss: cross_entropy #Options: cross_entropy, focal_loss, sice_loss
   correctnes_term: False
   focal_gamma: 0.5
-  weighted_cls: True
+  weighting_mode: none #Options: none, inverse_frequency_class_weights
   include_background_loss: True
   include_background_metrics: False
   include_background_gwd: True

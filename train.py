@@ -1,7 +1,7 @@
 import os
 import yaml
 import argparse
-
+# ~/miniconda3/envs/dev3d2/lib/python3.9/site-packages/
 #load experiment config
 config_file = 'config.yaml'
 with open(config_file, 'r') as file:
@@ -37,6 +37,7 @@ else:
 import uuid
 import itertools
 import json
+import re
 import glob
 import random
 import time
@@ -49,7 +50,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import SubsetRandomSampler
+from torch.utils.data import SubsetRandomSampler, WeightedRandomSampler
 
 #MONAI modules
 from monai.losses import DiceLoss
@@ -58,7 +59,7 @@ from monai.metrics import HausdorffDistanceMetric, SurfaceDistanceMetric, DiceMe
 from monai.metrics import CumulativeAverage
 from monai.optimizers import WarmupCosineSchedule
 from monai.data import ThreadDataLoader, DataLoader, decollate_batch
-from monai.data.dataset import PersistentDataset
+from monai.data.dataset import PersistentDataset, Dataset
 from monai.transforms import AsDiscrete
 from monai.utils import set_determinism
 from monai.inferers import sliding_window_inference
@@ -66,6 +67,12 @@ from monai.networks.utils import one_hot
 from PIL import Image
 
 from src.cuda_setup import configure_cuda
+from src.data_preparation import split_train_val, create_domain_labels, build_sampler, load_dataset_json
+from src.model import DWNet
+from src.scheduler import CosineAnnealingWarmupRestarts
+from src.losses import DiceCELoss, DiceFocalLoss
+from src.transforms import Transforms
+from src.logger import DummyExperiment
 
 def setup_training(args):
     
@@ -116,10 +123,13 @@ def setup_training(args):
 
     #DATA CACHE
     if not os.path.exists(args.cache_dir):
-        os.makedirs(os.path.join(args.cache_dir, 'train'))
-        os.makedirs(os.path.join(args.cache_dir, 'val'))
-        os.makedirs(os.path.join(args.cache_dir, 'test'))
-                    
+        os.makedirs(args.cache_dir)
+
+    for subdir in ['train', 'val', 'test']:
+        subdir_path = os.path.join(args.cache_dir, subdir)
+        if not os.path.exists(subdir_path):
+            os.makedirs(subdir_path)
+                        
     if args.clear_cache:
         print("Clearing cache...")
         train_cache = glob.glob(os.path.join(args.cache_dir, 'train/*.pt'))
@@ -138,31 +148,32 @@ def setup_training(args):
 
     return scaler, autocast_d_type, device
 
-def training_step(args, loss_fn, batch_idx, epoch, model, optimizer, scaler, data_sample, train_loader, experiment, autocast_d_type, device):
+def training_step(args, loss_fn, batch_idx, epoch, model, optimizer, scaler, data_sample, train_loader, logger, experiment, autocast_d_type, device):
     
     #OPTIMIZATION
-    with torch.cuda.amp.autocast(enabled=args.use_scaler, dtype=autocast_d_type):
-        output = model(data_sample["image"])
-        loss = loss_fn(output, data_sample["label"])
+    print(f"batch size: {args.batch_size}, batch_idx: {batch_idx}, {data_sample['image'].shape}, {data_sample['label'].shape}, source: {data_sample['image'].meta['filename_or_obj']}.")
+    # with torch.cuda.amp.autocast(enabled=args.use_scaler, dtype=autocast_d_type):
+    #     output = model(data_sample["image"])
+    #     loss = loss_fn(output, data_sample["label"])
     
-    if args.use_scaler and scaler is not None:
-        scaler.scale(loss).backward()
+    # if args.use_scaler and scaler is not None:
+    #     scaler.scale(loss).backward()
 
-        if args.grad_clip:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm, norm_type=2.0)
+    #     if args.grad_clip:
+    #         scaler.unscale_(optimizer)
+    #         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm, norm_type=2.0)
 
-        scaler.step(optimizer)
-        scaler.update()
-    else:
-        loss.backward()
+    #     scaler.step(optimizer)
+    #     scaler.update()
+    # else:
+    #     loss.backward()
 
-        if args.grad_clip:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm, norm_type=2.0)
+    #     if args.grad_clip:
+    #         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm, norm_type=2.0)
 
-        optimizer.step()
+    #     optimizer.step()
         
-    optimizer.zero_grad()
+    # optimizer.zero_grad()
     
     #get predictions
     #log metrics
@@ -183,14 +194,15 @@ def main():
     #load experiment configurations, setup cuda
     scaler, autocast_d_type, device = setup_training(args)
     
-    #setup logger
+    #setup experiment and logger
     if args.comet:
         experiment = Experiment(project_name="tf3")
         unique_experiment_name = experiment.get_name()
         experiment_key = experiment.get_key()
     else:
+        experiment = DummyExperiment()
         unique_experiment_name = uuid.uuid4().hex
-        args.batch_size=2
+        args.batch_size=1
         args.validation_interval = 5
         args.log_batch_interval = 5
         args.log_metrics_interval = 5
@@ -199,41 +211,72 @@ def main():
         args.log_slice_interval = 1
         args.log_3d_scene_interval_training = 5
         args.log_3d_scene_interval_validation = 5
+        
+    #TODO add logger    
+    logger = None
             
     print("--------------------")
     print (f"\n *** Starting experiment: {unique_experiment_name}:\n")
     print(f"Current server time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    #PREPARE DATASETS
-        
-    #setup data loaders
-    if args.use_random_sampler:
-        train_subsampler = SubsetRandomSampler(train_ids)
-        val_subsampler = SubsetRandomSampler(val_ids)
+    #PREPARE DATASETS   
+    dataset_json_path = os.path.join(args.data, "dataset.json")
+    class_labels = load_dataset_json(dataset_json_path)
+
+    train_data, val_data = split_train_val(args)
+    train_labels = create_domain_labels(train_data)
+    val_labels = create_domain_labels(val_data)
+
+    trans=Transforms(args, device=device)
+
+    if args.use_persistent_dataset:
+        train_dataset = PersistentDataset(data=train_data, transform=trans.train_transform, cache_dir=os.path.join(args.cache_dir, 'train'))
+        val_dataset = PersistentDataset(data=val_data, transform=trans.inference_transform, cache_dir=os.path.join(args.cache_dir, 'val'))
     else:
-        train_subsampler = train_ids
-        val_subsampler = val_ids
+        # Your normal Dataset class expects list of filenames or similar
+        train_dataset = Dataset(train_data, transform=trans.train_transform, root_dir=args.data)
+        val_dataset = Dataset(val_data, transform=trans.inference_transform, root_dir=args.data)
+
+    train_sampler = build_sampler(train_dataset, train_labels, args)
+    val_sampler = build_sampler(val_dataset, val_labels, args)
         
     if args.use_thread_loader:
-        train_loader = ThreadDataLoader(train_dataset, use_thread_workers=True, buffer_size=1, batch_size=args.batch_size, sampler=train_subsampler)
-        val_loader = ThreadDataLoader(val_dataset, use_thread_workers=True, buffer_size=1, batch_size=args.batch_size_val, sampler=val_subsampler)
-        test_loader_A = ThreadDataLoader(test_dataset, use_thread_workers=True, buffer_size=1, batch_size=args.batch_size_val, sampler=list(range(0,11)))
-        test_loader_B = ThreadDataLoader(test_dataset, use_thread_workers=True, buffer_size=1, batch_size=args.batch_size_val, sampler=list(range(11,20)))
+        train_loader = ThreadDataLoader(train_dataset, use_thread_workers=True, buffer_size=1, batch_size=args.batch_size, sampler=train_sampler)
+        val_loader = ThreadDataLoader(val_dataset, use_thread_workers=True, buffer_size=1, batch_size=args.batch_size_val, sampler=val_sampler)
+        # test_loader_A = ThreadDataLoader(test_dataset, use_thread_workers=True, buffer_size=1, batch_size=args.batch_size_val, sampler=list(range(0,11)))
+        # test_loader_B = ThreadDataLoader(test_dataset, use_thread_workers=True, buffer_size=1, batch_size=args.batch_size_val, sampler=list(range(11,20)))
     else:
-        train_loader = DataLoader(train_dataset, num_workers=args.num_workers, batch_size=args.batch_size, sampler=train_subsampler, worker_init_fn=np.random.seed(args.seed))
-        val_loader = DataLoader(val_dataset, num_workers=args.num_workers, batch_size=args.batch_size_val, sampler=val_subsampler)
-        test_loader_A = DataLoader(test_dataset, num_workers=args.num_workers, batch_size=args.batch_size_val, sampler=list(range(0,11)))
-        test_loader_B = DataLoader(test_dataset, num_workers=args.num_workers,batch_size=args.batch_size_val, sampler=list(range(11,20)))
+        train_loader = DataLoader(train_dataset, num_workers=args.num_workers, batch_size=args.batch_size, sampler=train_sampler, worker_init_fn=np.random.seed(args.seed))
+        val_loader = DataLoader(val_dataset, num_workers=args.num_workers, batch_size=args.batch_size_val, sampler=val_sampler)
+        # test_loader_A = DataLoader(test_dataset, num_workers=args.num_workers, batch_size=args.batch_size_val, sampler=list(range(0,11)))
+        # test_loader_B = DataLoader(test_dataset, num_workers=args.num_workers,batch_size=args.batch_size_val, sampler=list(range(11,20)))
     
     #setup model, optimizer, scheduler, losses, metrics
     #MODEL
-    model = nn.Linear(10, 10)  # Placeholder for actual model
+    #num classes = 10 anatomical classes + 32 tooth classes + 3 canal classes + 1 pulp
+    model = DWNet(spatial_dims=3, in_channels=1, out_channels=46, act=args.activation, norm=args.norm,
+                  bias=False, backbone_name=args.backbone_name, configuration='UNET')
     if args.parallel:
         model = nn.DataParallel(model).to(device)
     else:
         model = model.to(device)
     #LOSSES
-
+    if args.weighting_mode != 'none':
+        #TODO implement weights calculation, maybe json file?
+        if args.weighting_mode == 'inverse_frequency_class_weights':
+            weights = torch.tensor(class_labels['weights'], dtype=torch.float32, device=device)
+        else:
+            raise NotImplementedError(f"Weighting mode {args.weighting_mode} not implemented.")
+    else:
+        # no weights
+        weights = None
+        
+    weights = None
+    if args.seg_loss_name=="DiceCELoss":
+        criterion_seg = DiceCELoss(include_background=args.include_background_loss, ce_weight=weights, to_onehot_y=True, softmax=True)
+    elif args.seg_loss_name=="FocalDice":
+        criterion_seg = DiceFocalLoss(include_background=args.include_background_loss, focal_weight=weights, to_onehot_y=True, softmax=True, gamma=args.wasserstein_distance_matrix)
+    
     #OPTIMIZER
     if args.optimizer == "SGD":
         optimizer = optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, momentum=0.9)
@@ -245,11 +288,11 @@ def main():
         raise NotImplementedError(f"There are no implementation of: {args.optimizer}")
 
     # SCHEDULER
-    if args.scheduler_name == 'annealing':
-        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, verbose=True)
-    elif args.scheduler_name == 'warmup':
+    if args.scheduler_name == 'cosine_annealing':
+        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr, verbose=True)
+    elif args.scheduler_name == 'warmup_cosine':
         scheduler = WarmupCosineSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=args.epochs+100)
-    elif args.scheduler_name == "warmup_restarts":
+    elif args.scheduler_name == "warmup_cosine_restarts":
         scheduler = CosineAnnealingWarmupRestarts(optimizer, warmup_steps=args.warmup_steps, first_cycle_steps=int(
             args.epochs * args.first_cycle_steps), cycle_mult=0.5, gamma=args.scheduler_gamma, max_lr=args.lr, min_lr=args.min_lr)
 
@@ -287,7 +330,6 @@ def main():
     ]
     
     edt_reg_metrics=[MSEMetric(reduction=reduction)] 
-    seed_reg_metrics=[MSEMetric(reduction=reduction)]
 
     #train loss
     train_loss_cum = CumulativeAverage()
@@ -334,8 +376,8 @@ def main():
         #TRAINING LOOP
         start_time_epoch = time.time()
         for batch_idx, train_data in enumerate(train_loader):
-            training_step(args, batch_idx, epoch, model, criterion_dice, optimizer, scaler, train_data, train_loader, 
-                            log, experiment, train_loss_cum, seg_metrics_binary, train_dice_cum, train_hd_cum, autocast_d_type, device)
+            training_step(args, criterion_seg, batch_idx, epoch, model, optimizer, scaler, train_data, train_loader, 
+                          logger, experiment, autocast_d_type, device)
         epoch_time=time.time() - start_time_epoch
         print(f" Train loop finished - total time: {epoch_time:.2f}s.")
 
@@ -343,7 +385,6 @@ def main():
         if args.classes > 1:
             _ = [func.reset() for func in seg_metrics]
             _ = [func.reset() for func in edt_reg_metrics]
-            _ = [func.reset() for func in seed_reg_metrics]
             if (epoch+1) >= args.multiclass_metrics_epoch and (epoch+1) % args.multiclass_metrics_interval == 0:
                 _ = [func.reset() for func in seg_metrics_multiclass]
         else:
@@ -365,7 +406,6 @@ def main():
             if args.classes > 1:
                 _ = [func.reset() for func in seg_metrics]
                 _ = [func.reset() for func in edt_reg_metrics]
-                _ = [func.reset() for func in seed_reg_metrics]
                 if (epoch+1) >= args.multiclass_metrics_epoch and (epoch+1) % args.multiclass_metrics_interval == 0:
                     _ = [func.reset() for func in seg_metrics_multiclass]
             else:

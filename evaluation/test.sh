@@ -61,7 +61,6 @@ if [ $? -ne 0 ]; then
 fi
 
 #TODO - MANUALLY CHANGED USER TO 1002 to access my local server data, originally it was 1001
-
 docker run --rm \
     --platform=linux/amd64 \
     --network=none \
