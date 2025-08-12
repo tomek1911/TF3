@@ -48,6 +48,8 @@ args:
   sampler_type: weighted #weighted, random, sequential
   use_thread_loader: True
   use_persistent_dataset: True
+  generate_watershed_maps: True
+  watershed_maps_dir: data/deep_watershed_maps
   keys: 
     - image
     - label

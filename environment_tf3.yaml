@@ -20,7 +20,7 @@ dependencies:
   - pip
   - python=3.10.11
   - pytorch-cuda>=11.7,<11.9
-  - pytorch>=2.1,<=2.2
+  - pytorch>2.0
   - pyvista==0.38.1
   - torchmetrics
   - torchvision
@@ -35,3 +35,5 @@ dependencies:
   - jupyter
   - pip:
     - simpleitk==2.3.1
+    - cupy-cuda11x
+    - raster-geometry 

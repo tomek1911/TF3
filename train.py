@@ -223,11 +223,18 @@ def main():
     dataset_json_path = os.path.join(args.data, "dataset.json")
     class_labels = load_dataset_json(dataset_json_path)
 
-    train_data, val_data = split_train_val(args)
+    train_data, val_data, all_data_paths = split_train_val(args)
     train_labels = create_domain_labels(train_data)
     val_labels = create_domain_labels(val_data)
+    
+    if args.generate_watershed_maps:
+        from src.data_preparation import generate_watershed_maps
+        generate_watershed_maps(all_data_paths, args.watershed_maps_dir, device="cuda")
 
     trans=Transforms(args, device=device)
+    
+    #TODO use cache path
+    cache_path = os.path.join(args.cache_dir, f"b_{args.batch_size}_p_{args.patch_size[0]}_{args.patch_size[1]}_{args.patch_size[2]}", 'train')
 
     if args.use_persistent_dataset:
         train_dataset = PersistentDataset(data=train_data, transform=trans.train_transform, cache_dir=os.path.join(args.cache_dir, 'train'))
