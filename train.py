@@ -1,4 +1,5 @@
 import os
+import sys
 import yaml
 import argparse
 # ~/miniconda3/envs/dev3d2/lib/python3.9/site-packages/
@@ -35,6 +36,7 @@ else:
     print("Comet logger false.")
     
 import uuid
+import builtins
 import itertools
 import json
 import re
@@ -43,7 +45,11 @@ import random
 import time
 import warnings
 import numpy as np
+from tqdm import tqdm
 from datetime import datetime
+from contextlib import contextmanager
+from torch.utils.data._utils.collate import default_collate
+warnings.filterwarnings("ignore", category=FutureWarning, module="monai.data.dataset")
 
 # TORCH modules
 import torch
@@ -106,7 +112,7 @@ def setup_training(args):
         'float16': torch.float16,     
         'float32': torch.float32
         }
-        scaler = torch.cuda.amp.GradScaler()
+        scaler = torch.amp.GradScaler()
         autocast_d_type=TORCH_DTYPES[args.autocast_dtype]
         if autocast_d_type == torch.bfloat16:
             # detect gradient errors - debug cuda C code
@@ -122,19 +128,20 @@ def setup_training(args):
         device = torch.device("cpu")
 
     #DATA CACHE
-    if not os.path.exists(args.cache_dir):
-        os.makedirs(args.cache_dir)
+    args.cache_path = os.path.join(args.cache_dir, f"b_{args.batch_size}_p_{args.patch_size[0]}_{args.patch_size[1]}_{args.patch_size[2]}")
+    if not os.path.exists(args.cache_path):
+        os.makedirs(args.cache_path)
 
     for subdir in ['train', 'val', 'test']:
-        subdir_path = os.path.join(args.cache_dir, subdir)
+        subdir_path = os.path.join(args.cache_path, subdir)
         if not os.path.exists(subdir_path):
             os.makedirs(subdir_path)
                         
     if args.clear_cache:
         print("Clearing cache...")
-        train_cache = glob.glob(os.path.join(args.cache_dir, 'train/*.pt'))
-        val_cache = glob.glob(os.path.join(args.cache_dir, 'val/*.pt'))
-        test_cache = glob.glob(os.path.join(args.cache_dir, 'test/*.pt'))
+        train_cache = glob.glob(os.path.join(args.cache_path, 'train/*.pt'))
+        val_cache = glob.glob(os.path.join(args.cache_path, 'val/*.pt'))
+        test_cache = glob.glob(os.path.join(args.cache_path, 'test/*.pt'))
         if len(train_cache) != 0:
             for file in train_cache:
                 os.remove(file)
@@ -144,51 +151,69 @@ def setup_training(args):
         if len(test_cache) != 0:
             for file in test_cache:
                 os.remove(file)
-        print(f"Cleared cache in dir: {args.cache_dir}, train: {len(train_cache)} files, val: {len(val_cache)} files, test: {len(test_cache)} files.")
+        print(f"Cleared cache in dir: {args.cache_path}, train: {len(train_cache)} files, val: {len(val_cache)} files, test: {len(test_cache)} files.")
 
     return scaler, autocast_d_type, device
 
 def training_step(args, loss_fn, batch_idx, epoch, model, optimizer, scaler, data_sample, train_loader, logger, experiment, autocast_d_type, device):
-    
-    #OPTIMIZATION
-    print(f"batch size: {args.batch_size}, batch_idx: {batch_idx}, {data_sample['image'].shape}, {data_sample['label'].shape}, source: {data_sample['image'].meta['filename_or_obj']}.")
-    # with torch.cuda.amp.autocast(enabled=args.use_scaler, dtype=autocast_d_type):
-    #     output = model(data_sample["image"])
-    #     loss = loss_fn(output, data_sample["label"])
-    
-    # if args.use_scaler and scaler is not None:
-    #     scaler.scale(loss).backward()
-
-    #     if args.grad_clip:
-    #         scaler.unscale_(optimizer)
-    #         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm, norm_type=2.0)
-
-    #     scaler.step(optimizer)
-    #     scaler.update()
-    # else:
-    #     loss.backward()
-
-    #     if args.grad_clip:
-    #         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm, norm_type=2.0)
-
-    #     optimizer.step()
+    # print(f"batch size: {args.batch_size}, batch_idx: {batch_idx}, \
+    #       image: {data_sample['image'].shape}, label: {data_sample['label'].shape}, watershed_map: {data_sample['watershed_map'].shape} \
+    #       source: {data_sample['image'].meta['filename_or_obj']}.")
+    with torch.amp.autocast(enabled=args.use_scaler, dtype=autocast_d_type, device_type=device.type):
+        output = model(data_sample["image"])
+        (seg_multiclass, dist, dir, pulp) = output
+        multiclass_dice_loss, ce_loss = loss_fn(seg_multiclass, data_sample["label"][:,0:1]) #primary labels - no pulp loss
+        loss = multiclass_dice_loss + ce_loss
         
-    # optimizer.zero_grad()
+        if args.use_scaler and scaler is not None:
+            scaler.scale(loss).backward()
+            if args.grad_clip:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm, norm_type=2.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if args.grad_clip:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm, norm_type=2.0)
+            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
     
     #get predictions
     #log metrics
     #log qualitative results
     
 # INFERENCE STEP
-def inference_step(args, loss_fn, batch_idx, epoch, model, optimizer, scaler, data_sample, train_loader, experiment, autocast_d_type, device):
-    with warnings.catch_warnings(), \
-         torch.cuda.amp.autocast(enabled=args.use_scaler, dtype=autocast_d_type):
-        output = sliding_window_inference(data_sample["image"], roi_size=args.patch_size, sw_batch_size=8, predictor=model, 
-                                            overlap=0.5, sw_device=device, device=device, mode='gaussian', sigma_scale=0.125,
-                                            padding_mode='constant', cval=0, progress=False)
+def inference_step(args, batch_idx, epoch, model, scaler, data_sample, data_loader, experiment, autocast_d_type, device):
+    with warnings.catch_warnings(), torch.amp.autocast(enabled=args.use_scaler, dtype=autocast_d_type):
+        pass
+        #  output = sliding_window_inference(data_sample["image"], roi_size=args.patch_size, sw_batch_size=8, predictor=model, 
+        #                                     overlap=0.5, sw_device=device, device=device, mode='gaussian', sigma_scale=0.125,
+        #                                     padding_mode='constant', cval=0, progress=False)
     #get predictions
     #log metrics
     #log qualitative results
+
+_builtin_print = builtins.print  # store the original print
+
+@contextmanager
+def use_tqdm_print(args=None):
+    """
+    Context manager to replace print with tqdm.write if args.use_tqdm_print is True.
+    
+    Args:
+        args: Namespace or object with attribute `use_tqdm_print`. 
+              If None, defaults to always using normal print.
+    """
+    if args is not None and getattr(args, "use_tqdm_print", False):
+        def tqdm_print(*print_args, **kwargs):
+            tqdm.write(" ".join(str(a) for a in print_args))
+
+        builtins.print = tqdm_print
+    try:
+        yield
+    finally:
+        builtins.print = _builtin_print
 
 def main():
     #load experiment configurations, setup cuda
@@ -203,7 +228,7 @@ def main():
         experiment = DummyExperiment()
         unique_experiment_name = uuid.uuid4().hex
         args.batch_size=1
-        args.validation_interval = 5
+        args.validation_interval = 10
         args.log_batch_interval = 5
         args.log_metrics_interval = 5
         args.multiclass_metrics_interval = 5
@@ -211,6 +236,7 @@ def main():
         args.log_slice_interval = 1
         args.log_3d_scene_interval_training = 5
         args.log_3d_scene_interval_validation = 5
+        args.debug_data_limit = -1
         
     #TODO add logger    
     logger = None
@@ -229,16 +255,16 @@ def main():
     
     if args.generate_watershed_maps:
         from src.data_preparation import generate_watershed_maps
-        generate_watershed_maps(all_data_paths, args.watershed_maps_dir, device="cuda")
+        args.watershed_maps_dir = os.path.join(args.data, args.watershed_maps_folder)
+        watershed_files_paths = [os.path.join(args.watershed_maps_source_labels, f) for f in os.listdir(args.watershed_maps_source_labels) if f.endswith("_primary.nii.gz")]
+        watershed_files_paths.sort()
+        generate_watershed_maps(watershed_files_paths, args.watershed_maps_dir, device="cuda")
 
     trans=Transforms(args, device=device)
     
-    #TODO use cache path
-    cache_path = os.path.join(args.cache_dir, f"b_{args.batch_size}_p_{args.patch_size[0]}_{args.patch_size[1]}_{args.patch_size[2]}", 'train')
-
     if args.use_persistent_dataset:
-        train_dataset = PersistentDataset(data=train_data, transform=trans.train_transform, cache_dir=os.path.join(args.cache_dir, 'train'))
-        val_dataset = PersistentDataset(data=val_data, transform=trans.inference_transform, cache_dir=os.path.join(args.cache_dir, 'val'))
+        train_dataset = PersistentDataset(data=train_data, transform=trans.cpu_transform, cache_dir=os.path.join(args.cache_path, 'train'))
+        val_dataset = PersistentDataset(data=val_data, transform=trans.inference_transform, cache_dir=os.path.join(args.cache_path, 'val'))
     else:
         # Your normal Dataset class expects list of filenames or similar
         train_dataset = Dataset(train_data, transform=trans.train_transform, root_dir=args.data)
@@ -253,18 +279,19 @@ def main():
         # test_loader_A = ThreadDataLoader(test_dataset, use_thread_workers=True, buffer_size=1, batch_size=args.batch_size_val, sampler=list(range(0,11)))
         # test_loader_B = ThreadDataLoader(test_dataset, use_thread_workers=True, buffer_size=1, batch_size=args.batch_size_val, sampler=list(range(11,20)))
     else:
-        train_loader = DataLoader(train_dataset, num_workers=args.num_workers, batch_size=args.batch_size, sampler=train_sampler, worker_init_fn=np.random.seed(args.seed))
-        val_loader = DataLoader(val_dataset, num_workers=args.num_workers, batch_size=args.batch_size_val, sampler=val_sampler)
+        train_loader = DataLoader(train_dataset, num_workers=args.num_workers, batch_size=args.batch_size, sampler=train_sampler, pin_memory=args.pin_memory, worker_init_fn=np.random.seed(args.seed))
+        val_loader = DataLoader(val_dataset, num_workers=args.num_workers, batch_size=args.batch_size_val, sampler=val_sampler, pin_memory=args.pin_memory)
         # test_loader_A = DataLoader(test_dataset, num_workers=args.num_workers, batch_size=args.batch_size_val, sampler=list(range(0,11)))
         # test_loader_B = DataLoader(test_dataset, num_workers=args.num_workers,batch_size=args.batch_size_val, sampler=list(range(11,20)))
     
     #setup model, optimizer, scheduler, losses, metrics
     #MODEL
     #num classes = 10 anatomical classes + 32 tooth classes + 3 canal classes + 1 pulp
-    model = DWNet(spatial_dims=3, in_channels=1, out_channels=46, act=args.activation, norm=args.norm,
-                  bias=False, backbone_name=args.backbone_name, configuration='UNET')
+    model = DWNet(spatial_dims=3, in_channels=1, out_channels=args.out_channels, act=args.activation, norm=args.norm,
+                  bias=False, backbone_name=args.backbone_name, configuration=args.configuration)
     if args.parallel:
-        model = nn.DataParallel(model).to(device)
+        model = nn.DataParallel(model)
+        model = model.to(device)
     else:
         model = model.to(device)
     #LOSSES
@@ -376,15 +403,29 @@ def main():
     best_dice_score = 0.0
     best_dice_val_score = 0.0
     best_dice_multiclass_val_score = 0.0
-    for epoch in range(args.start_epoch, args.epochs):
-
+    
+    #Setup print
+    disable_tqdm = not sys.stderr.isatty()
+    
+    for epoch in tqdm(range(args.start_epoch, args.epochs), desc="Epochs", file=sys.stderr,
+                      position=0, leave=True, disable=disable_tqdm):
         print(f"Starting epoch {epoch + 1}")
         model.train()
         #TRAINING LOOP
         start_time_epoch = time.time()
-        for batch_idx, train_data in enumerate(train_loader):
-            training_step(args, criterion_seg, batch_idx, epoch, model, optimizer, scaler, train_data, train_loader, 
-                          logger, experiment, autocast_d_type, device)
+        with use_tqdm_print(args.use_tqdm_print):
+            for batch_idx, train_data in tqdm(enumerate(train_loader), desc=f"Training (epoch {epoch+1})", total=len(train_loader),
+                                            file=sys.stderr, position=1, leave=False, disable=disable_tqdm):
+                #Separate cpu and gpu
+                batch_list = []
+                batch_size = train_data["image"].shape[0]
+                for i in range(batch_size):
+                    sample = {k: v[i] for k, v in train_data.items()}
+                    sample = trans.gpu_transform(sample)  # apply GPU transforms per sample
+                    batch_list.append(sample)
+                train_data = default_collate(batch_list)[0]
+                training_step(args, criterion_seg, batch_idx, epoch, model, optimizer, scaler, train_data, train_loader, 
+                            logger, experiment, autocast_d_type, device)
         epoch_time=time.time() - start_time_epoch
         print(f" Train loop finished - total time: {epoch_time:.2f}s.")
 
@@ -404,8 +445,7 @@ def main():
             start_time_validation = time.time()
             for batch_idx, val_data in enumerate(val_loader):
                 with torch.no_grad():
-                    inference_step(args, batch_idx, epoch, model, val_data, val_loader, log, experiment,
-                                seg_metrics_binary, val_dice_cum, val_hd_cum, autocast_d_type, device)
+                    inference_step(args, batch_idx, epoch, model, scaler, val_data, val_loader, experiment, autocast_d_type, device)
             val_time=time.time() - start_time_validation
             print( f"Validation time: {val_time:.2f}s")
                     
@@ -446,7 +486,8 @@ def main():
             
             #TEST
             if args.perform_test:
-                for batch_idx, test_sample in enumerate(test_loader):
+                #TODO add test
+                for batch_idx, test_sample in enumerate(...):
                     with torch.no_grad():
                         inference_step(args, batch_idx, epoch, model, test_sample, test_loader, log, experiment,
                                         seg_metrics_binary, val_dice_cum, val_hd_cum, autocast_d_type, device)
@@ -456,7 +497,7 @@ def main():
         # CHECKPOINTS SAVE
         if args.save_checkpoints:
             #create unique experiment name
-            directory = f"checkpoints/{args.checkpoint_dir}/{unique_experiment_name}/classes_{str(args.classes)}_{loss_name}"
+            directory = f"checkpoints/{args.checkpoint_dir}/{unique_experiment_name}/classes_{str(args.classes)}_{args.seg_loss_name}"
             if not os.path.exists(directory):
                 os.makedirs(directory)
                 
@@ -537,7 +578,7 @@ def main():
         
         #Final epoch report
         epoch_time=time.time() - start_time_epoch
-        print(f"Epoch: {epoch+1} finished. Total training loss: {train_loss_agg[0]:.4f} - total epoch time: {epoch_time:.2f}s.")
+        # print(f"Epoch: {epoch+1} finished. Total training loss: {train_loss_agg[0]:.4f} - total epoch time: {epoch_time:.2f}s.")
     
     print(f"Experiment finished! logging to comet server...")
     #wait to move logs to comet
@@ -548,4 +589,6 @@ def main():
     print("---------------------------------------------------------\n")
 
 if __name__ == "__main__":
+    # import torch.multiprocessing as mp
+    # mp.set_start_method("spawn", force=True)
     main()

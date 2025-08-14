@@ -8,6 +8,7 @@ channels:
 dependencies:
   - autopep8
   - comet_ml
+  - connected-components-3d
   - einops
   - ipykernel
   - ipython

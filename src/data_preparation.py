@@ -40,8 +40,9 @@ def split_train_val(args):
     Select `args.val_items` files per device for validation.
     Returns two lists of filenames.
     """
-    images_dir = os.path.join(args.data, "imagesTr")
-    labels_dir = os.path.join(args.data, "labelsTr")
+    images_dir = os.path.join(args.data, args.images_folder)
+    labels_dir = os.path.join(args.data, args.labels_folder)
+    watershed_dir = os.path.join(args.data, args.watershed_maps_folder)
 
     device_files = defaultdict(list)
     # List image files only
@@ -57,12 +58,18 @@ def split_train_val(args):
     train_files = []
     for device, files in device_files.items():
         val_files.extend(files[:args.val_items])
-        train_files.extend(files[args.val_items:])
+        if args.debug_data_limit != -1:
+            train_files.extend(files[args.val_items:args.debug_data_limit])
+        else:
+            train_files.extend(files[args.val_items:])
         
     # Pair image and label files - remove '_0000.nii.gz' from image filenames to match label filenames
     def pair_files(file_list):
         return [
-            {"image": os.path.join(images_dir, f), "label": os.path.join(labels_dir, f.replace("_0000.nii.gz", ".nii.gz"))}
+            {args.keys[0]: os.path.join(images_dir, f),
+             args.keys[1]: os.path.join(labels_dir, f.replace("_0000.nii.gz", ".nii.gz")),
+             args.keys[2]: os.path.join(watershed_dir, f.replace("_0000.nii.gz", ".nii.gz"))
+             }
             for f in file_list
         ]
 
@@ -220,16 +227,34 @@ def generate_watershed_maps(input_data_list, output_dir, device='cuda'):
     distance_map_gen = WatershedDistanceMapGenerator(device=device)      
     for item in tqdm(input_data_list):
         nib_vol = nib.load(item)
-        label_volume = nib_vol.get_fdata().astype(np.int32)
+        label_volume = np.asanyarray(nib_vol.dataobj, dtype=np.uint8) 
            
         dist_map =  distance_map_gen.get_edt_map(label_volume)
         dir_map = distance_map_gen.get_dir_map(dist_map)
+        dir_map = np.moveaxis(dir_map, 0, -1) # make it channel last
         
-        dist_nib_array = nib.Nifti1Image(dist_map, nib_vol.affine, nib_vol.header)
-        dir_nib_array = nib.Nifti1Image(dir_map, nib_vol.affine, nib_vol.header)
+        # Save
+        file_name = item.split('/')[-1].replace('_primary.nii.gz', '.nii.gz')
+        nib.save(nib.Nifti1Image(dist_map, nib_vol.affine), os.path.join(output_dir, 'distance_maps', file_name))
+        nib.save(nib.Nifti1Image(dir_map, nib_vol.affine), os.path.join(output_dir, 'direction_maps', file_name))
         
-        nib.save(dist_nib_array, os.path.join(output_dir, 'distance_maps', item.split('/')[-1]))
-        nib.save(dir_nib_array, os.path.join(output_dir, 'distance_maps', item.split('/')[-1]))
+        # DIST_DIR
+        dist_map_ch = dist_map[..., np.newaxis]           # shape (X, Y, Z, 1)
+        combined_maps = np.concatenate([dist_map_ch, dir_map], axis=-1)  # shape: (X, Y, Z, 4)
+        # Use the header of the first image, but adjust dimensionality
+        hdr = nib_vol.header.copy()
+        hdr.set_data_dtype(np.float32)
+        hdr.set_data_shape(combined_maps.shape)
+        hdr['dim'][0] = 4                       # number of dimensions
+        hdr['dim'][1] = combined_maps.shape[0]  # X
+        hdr['dim'][2] = combined_maps.shape[1]  # Y
+        hdr['dim'][3] = combined_maps.shape[2]  # Z
+        hdr['dim'][4] = combined_maps.shape[3]  # channels (C)
+        hdr['intent_code'] = 1007      # NIFTI_INTENT_VECTOR
+        hdr['intent_name'] = b'Vector'
+        
+        # Save
+        nib.save(nib.Nifti1Image(combined_maps, affine=nib_vol.affine, header=hdr), os.path.join(output_dir, 'distdir_maps', file_name))
         
 if __name__ == "__main__":
     import nibabel as nib

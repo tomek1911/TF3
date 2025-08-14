@@ -45,8 +45,9 @@ class DWNet(nn.Module):
         self.validation_mode = False
         
         #decoder configuration
-        self.is_edt = 'EDT' in configuration
+        self.is_dist = 'DIST' in configuration
         self.is_dir = 'DIR' in configuration
+        self.is_pulp = 'PULP' in configuration
         
         #DECODER
         ch4, ch3, ch2 = 256, 128, 64 #skip_channels: 512, 256, 128, 64, 64 (resnet34)
@@ -63,10 +64,13 @@ class DWNet(nn.Module):
         self.decoder_blocks = nn.ModuleList([conv4, conv3, conv2])
         
         #instance map
-        if self.is_edt:
-            self.edt_decoder = nn.ConvTranspose3d(ch2+up_channels[0], 1, kernel_size=3, padding=1, bias=bias, stride=2, dilation=1, output_padding=1)
+        if self.is_dist:
+            self.dist_decoder = nn.ConvTranspose3d(ch2+up_channels[0], 1, kernel_size=3, padding=1, bias=bias, stride=2, dilation=1, output_padding=1)
         if self.is_dir:
             self.direction_decoder = nn.ConvTranspose3d(ch2+up_channels[0], 3, kernel_size=3, padding=1, bias=bias, stride=2, dilation=1, output_padding=1)
+        if self.is_pulp:
+            self.pulp_decoder = nn.ConvTranspose3d(ch2+up_channels[0], 1, kernel_size=3, padding=1, bias=bias, stride=2, dilation=1, output_padding=1)
+        
 
         #segmentation
         self.segmentation_decoder = nn.Sequential(nn.ConvTranspose3d(ch3+up_channels[1], ch2, kernel_size=3, padding=1, bias=bias, stride=1),
@@ -102,18 +106,22 @@ class DWNet(nn.Module):
             x = layer(x)
         
         seg_multiclass = self.multiclass_decoder(torch.cat([seg, features[-1]], dim=1))
-        if self.is_edt:
-            edt = self.edt_decoder(torch.cat([x, features[-1]], dim=1))   
-            if self.is_dir:
-                edt_direction = self.direction_decoder(torch.cat([x, features[-1]], dim=1))
-                edt_direction = f.normalize(edt_direction, p=2.0, dim=1, eps=1e-12)
-            else:
-                edt_direction = self._get_cached_zeros((B, 3, *s_dim), x.device)
-        else:
-            edt = self._get_cached_zeros((B, 1, *s_dim), x.device)
-            edt_direction = self._get_cached_zeros((B, 3, *s_dim), x.device)
+        dist = self.dist_decoder(torch.cat([x, features[-1]], dim=1)) 
+        dir = self.direction_decoder(torch.cat([x, features[-1]], dim=1))
+        pulp = self.pulp_decoder(torch.cat([x, features[-1]], dim=1))
+        
+        # if self.is_edt:
+        #     edt = self.edt_decoder(torch.cat([x, features[-1]], dim=1))   
+        #     if self.is_dir:
+        #         edt_direction = self.direction_decoder(torch.cat([x, features[-1]], dim=1))
+        #         edt_direction = f.normalize(edt_direction, p=2.0, dim=1, eps=1e-12)
+        #     else:
+        #         edt_direction = self._get_cached_zeros((B, 3, *s_dim), x.device)
+        # else:
+        #     edt = self._get_cached_zeros((B, 1, *s_dim), x.device)
+        #     edt_direction = self._get_cached_zeros((B, 3, *s_dim), x.device)
 
-        return seg_multiclass, edt, edt_direction
+        return seg_multiclass, dist, dir, pulp
         
 if __name__ == "__main__":
     
@@ -121,7 +129,6 @@ if __name__ == "__main__":
     import time
     import numpy as np
     from monai.inferers import sliding_window_inference
-    from torch.cuda.amp import autocast
     backbone_name = 'resnet34'
     device = "cuda:0"
     model = DWNet(spatial_dims=3,
@@ -160,7 +167,7 @@ if __name__ == "__main__":
             torch.cuda.synchronize()
             start = time.time()
             # output = model(input)
-            with autocast(enabled=True, dtype=torch.float16): 
+            with torch.amp.autocast(enabled=True, dtype=torch.float16, device_type=device): 
                 output = sliding_window_inference(input, roi_size=patch_size, sw_batch_size=1, predictor=model, 
                                         overlap=0.5, sw_device=device, device='cpu', mode='gaussian', sigma_scale=0.125,
                                         padding_mode='constant', cval=0, progress=False)

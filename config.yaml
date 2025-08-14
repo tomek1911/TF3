@@ -14,7 +14,10 @@ general:
 args:
   comet: False
   print_config: False
+  perform_test: False
+  debug_data_limit: -1
   tags: null
+  use_tqdm_print: True
   is_log_qualitative_2d: True
   is_log_qualitative_3d: False
   validation_interval: 20
@@ -34,44 +37,62 @@ args:
   cuda_device_id: 0
   parallel: False
   gpu_frac: 1.0
-  num_threads: 8
+  num_threads: 16
   pin_memory: False
 
 # --------------------------------------------------
 # Data & Preprocessing & Augmentation
 # --------------------------------------------------
   data: data
+  images_folder: imagesTr
+  labels_folder: labelsRemapped # Option: labelsTr 
+  watershed_maps_folder: deep_watershed_maps/distdir_maps
   cache_dir: data/cache
   clear_cache: False
   val_items: 10
   use_json_split: True
   sampler_type: weighted #weighted, random, sequential
-  use_thread_loader: True
+  use_thread_loader: False
+  pin_memory: True
+  num_workers: 8
   use_persistent_dataset: True
-  generate_watershed_maps: True
-  watershed_maps_dir: data/deep_watershed_maps
+  generate_watershed_maps: False
+
+  watershed_maps_source_labels: data/labelsRemapped # Option: data/labelsTr
   keys: 
     - image
     - label
+    - watershed_map
+  pixdim: 0.3
+  houndsfield_clip: 3000
   patch_size: 
     - 304
     - 304
     - 176
-  # spatial_crop_size: 
-  #   - 224
-  #   - 192
-  #   - 160
-  # spatial_crop_margin:
-  #   - 32
-  #   - 32
-  #   - 32
-  crop_foreground: True
-  crop_samples: 2
-  pixdim: 0.4
-  houndsfield_clip: 3000    
-  z_score_norm: False  
-  rotation_range: 0.1
+  crop_samples: 1
+
+  # Geometric Augmentation
+  use_augmentations: True
+  rotation_range_xy: 0.1       # max rotation in radians (~5-6 degrees)
+  rotation_range_z: 0.15 
+  rotation_prob: 0.75        # probability to apply rotation
+  scale_range: 0.05           # skip scaling to avoid interpolation artifacts
+  use_anisotropic: True
+  min_zoom: 0.95
+  max_zoom: 1.05
+  zoom_prob: 0.5
+
+  # Intensity Augmentation
+  intensity_scale: 0.15
+  intensity_scale_prob: 0.5
+  intensity_shift: 0.2
+  intensity_shift_prob: 0.5
+  contrast : 0.3
+  intensity_contrast_prob: 0.5
+
+  # Monai & preprocessing
   lazy_interpolation: True
+  seed: 42
 
 # --------------------------------------------------
 # Model Architecture
@@ -81,7 +102,8 @@ args:
   norm: instance
   activation: relu
   backbone_name: resnet34 #Options: resnet18, resnet34, resnet50
-  classes: 33
+  out_channels: 46 # 10 misc anatomy, 32 teeth, 3 canals + bg
+  configuration: DIST_DIR_PULP
 
 # --------------------------------------------------
 # Training Hyperparameters
@@ -127,7 +149,7 @@ args:
 # --------------------------------------------------
 # Checkpointing & Resume
 # --------------------------------------------------
-  save_checkpoints: True
+  save_checkpoints: False
   checkpoint_dir: experiments
   save_interval: 100
   save_optimiser_interval: 200
