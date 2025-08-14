@@ -103,6 +103,7 @@ args:
   activation: relu
   backbone_name: resnet34 #Options: resnet18, resnet34, resnet50
   out_channels: 46 # 10 misc anatomy, 32 teeth, 3 canals + bg
+  classes: 45 
   configuration: DIST_DIR_PULP
 
 # --------------------------------------------------

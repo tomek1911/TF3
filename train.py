@@ -63,7 +63,7 @@ from monai.losses import DiceLoss
 from monai.metrics import MSEMetric
 from monai.metrics import HausdorffDistanceMetric, SurfaceDistanceMetric, DiceMetric
 from monai.metrics import CumulativeAverage
-from monai.optimizers import WarmupCosineSchedule
+# from monai.optimizers import WarmupCosineSchedule
 from monai.data import ThreadDataLoader, DataLoader, decollate_batch
 from monai.data.dataset import PersistentDataset, Dataset
 from monai.transforms import AsDiscrete
@@ -75,7 +75,7 @@ from PIL import Image
 from src.cuda_setup import configure_cuda
 from src.data_preparation import split_train_val, create_domain_labels, build_sampler, load_dataset_json
 from src.model import DWNet
-from src.scheduler import CosineAnnealingWarmupRestarts
+from src.scheduler import CosineAnnealingWarmupRestarts, WarmupCosineSchedule
 from src.losses import DiceCELoss, DiceFocalLoss
 from src.transforms import Transforms
 from src.logger import DummyExperiment
@@ -325,7 +325,7 @@ def main():
     if args.scheduler_name == 'cosine_annealing':
         scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr, verbose=True)
     elif args.scheduler_name == 'warmup_cosine':
-        scheduler = WarmupCosineSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=args.epochs+100)
+        scheduler = WarmupCosineSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=args.epochs, min_lr=args.min_lr)
     elif args.scheduler_name == "warmup_cosine_restarts":
         scheduler = CosineAnnealingWarmupRestarts(optimizer, warmup_steps=args.warmup_steps, first_cycle_steps=int(
             args.epochs * args.first_cycle_steps), cycle_mult=0.5, gamma=args.scheduler_gamma, max_lr=args.lr, min_lr=args.min_lr)

@@ -1,6 +1,7 @@
 import math
 import torch
-from torch.optim.lr_scheduler import _LRScheduler
+from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
+from torch.optim import Optimizer
 
 class CosineAnnealingWarmupRestarts(_LRScheduler):
     """
@@ -86,3 +87,96 @@ class CosineAnnealingWarmupRestarts(_LRScheduler):
         self.last_epoch = math.floor(epoch)
         for param_group, lr in zip(self.optimizer.param_groups, self.get_lr()):
             param_group['lr'] = lr
+            
+
+class WarmupCosineSchedule(LambdaLR):
+    """Linear warmup and then cosine decay.
+    Based on https://huggingface.co/ implementation.
+    """
+
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        warmup_steps: int,
+        t_total: int,
+        min_lr: float = 0.0,
+        cycles: float = 0.5,
+        last_epoch: int = -1,
+        warmup_start_multiplier: float = 0,
+    ) -> None:
+        """
+        Args:
+            optimizer: wrapped optimizer.
+            warmup_steps: number of warmup iterations.
+            t_total: total number of training iterations.
+            min_lr: Minimum LR at the end of cosine decay.
+            cycles: cosine cycles parameter.
+            last_epoch: the index of last epoch.
+            warmup_start_multiplier: if provided, starts the linear warmup from this fraction of the initial lr.
+                Must be in 0..1 interval. Defaults to 0
+        Returns:
+            None
+        """
+        self.warmup_steps = min(max(warmup_steps, 0), t_total)
+        self.warmup_multiplier = warmup_start_multiplier
+        self.t_total = t_total
+        self.cycles = cycles
+        self.min_lr = min_lr
+        if self.warmup_multiplier < 0 or self.warmup_multiplier > 1:
+            raise ValueError("warmup_multiplier must be in 0..1 range")
+        super().__init__(optimizer, self.lr_lambda, last_epoch)
+    
+    def lr_lambda(self, step: int):
+        if step < self.warmup_steps:
+            # Linear warmup from warmup_start_multiplier -> 1
+            f = float(step) / max(1.0, self.warmup_steps)
+            return self.warmup_multiplier + (1.0 - self.warmup_multiplier) * f
+        # Cosine decay to min_lr
+        progress = float(step - self.warmup_steps) / max(1, self.t_total - self.warmup_steps)
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * self.cycles * 2.0 * progress))
+        return self.min_lr + (1.0 - self.min_lr) * cosine_decay
+    
+def main():
+    import torch
+    from torch.optim import SGD
+    from torch.optim.lr_scheduler import LambdaLR
+    import matplotlib.pyplot as plt
+        
+    model_param = torch.nn.Parameter(torch.randn(1))
+    optimizer = SGD([model_param], lr=0.1)
+
+    # Scheduler parameters
+    t_total = 1000
+    warmup_steps = 100
+    min_lr = 0.1
+    cycles = 0.5
+    warmup_start_multiplier = 0.0
+
+    scheduler = WarmupCosineSchedule(
+        optimizer,
+        warmup_steps=warmup_steps,
+        t_total=t_total,
+        min_lr=min_lr,
+        cycles=cycles,
+        warmup_start_multiplier=warmup_start_multiplier
+    )
+
+    # Track learning rates
+    lrs = []
+    for step in range(t_total):
+        optimizer.step()
+        lrs.append(optimizer.param_groups[0]['lr'])
+        scheduler.step()
+
+    # Plot
+    plt.figure(figsize=(8,4))
+    plt.plot(lrs)
+    plt.xlabel("Step")
+    plt.ylabel("Learning Rate")
+    plt.title("Warmup + Cosine LR Schedule")
+    plt.grid(True)
+    plt.savefig("warmup_cosine_lr.png")
+    print("Saved plot as warmup_cosine_lr.png")
+
+if __name__ == "__main__":
+    main()
