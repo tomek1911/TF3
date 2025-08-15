@@ -309,3 +309,60 @@ class DiceFocalLoss(_Loss):
         focal_loss = self.focal(input, target)
         # total_loss: torch.Tensor = self.lambda_dice * dice_loss + self.lambda_focal * focal_loss
         return dice_loss, focal_loss 
+    
+class AngularLoss(_Loss):
+    '''
+    angular loss
+    '''
+
+    def __init__(self,
+                 eps=1e-6,
+                 eps_angle=1e-7,
+                 reduction='mean'):
+        super(AngularLoss, self).__init__(reduction=reduction)
+        self.eps = eps
+        self.eps_angle = eps_angle
+        self.reduction=reduction
+
+    def forward(self, pred, gt, mask):
+        # reshape according to the spatial dimention - to get n-dimensional unit vectors
+        gt_vector = gt.reshape(gt.shape[:2] + (-1,)) * (1-self.eps)
+        pred_vector = pred.reshape(gt.shape[:2] + (-1,)) * (1-self.eps)
+        binary_mask_vector = mask.reshape(mask.shape[:1] + (-1,))       
+        #clip cosinus to -1,1 for numerical stability
+        angle_errors = torch.acos(torch.clamp(torch.sum(gt_vector*pred_vector, dim=1, keepdim=False),-1+self.eps_angle,1-self.eps_angle))
+        loss = torch.sum(angle_errors*angle_errors*binary_mask_vector, dim=1)
+
+        if self.reduction == 'mean':
+            return torch.mean(loss)
+        elif self.reduction == 'sum':
+            return torch.sum(loss)
+        elif self.reduction == 'none':
+            return loss
+
+class FocalDiceBCELoss(nn.Module):
+    """
+    Combined loss for 1-channel segmentation: BCE + Focal Dice.
+    
+    Args:
+        alpha (float): weight for BCE loss. Focal Dice weight = 1 - alpha
+        gamma (float): focusing exponent for Focal Dice
+        bce_weight (float, optional): weight for positive class in BCE (default=1.0)
+        smooth (float, optional): smoothing factor for Dice calculation
+    """
+    def __init__(self, alpha=0.5, gamma=1.0, bce_weight=1.0):
+        super().__init__()
+        self.alpha = alpha
+        self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(bce_weight))
+        self.focal_dice = DiceFocalLoss(sigmoid=True, gamma=gamma)
+
+    def forward(self, logits, target):
+        """
+        Args:
+            logits: raw network output, shape (B, 1, D, H, W)
+            target: ground truth, shape (B, 1, D, H, W)
+        """
+        bce = self.bce_loss(logits, target.float())
+        dice_loss, focal_loss  = self.focal_dice(logits, target)
+        focal_dice_loss = 0.1 * focal_loss + 0.9 * dice_loss
+        return self.alpha * bce + (1 - self.alpha) * focal_dice_loss

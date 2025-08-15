@@ -47,7 +47,7 @@ def move_to_device(x, device):
     if x.device == device:
         return x
     else:
-        return x.to(device)
+        return x.to(device, non_blocking=True)
     
 def to_float(x):
     return x.float()
@@ -55,7 +55,7 @@ def to_float(x):
 def to_long(x):
     return x.long()
 
-def remap_labels(label: torch.Tensor, mapping: dict, channel_id: int = 0) -> torch.Tensor:
+def remap_labels(label: torch.Tensor, mapping: dict, channel_id: int = 0, default_class: int = 0) -> torch.Tensor:
     """
     Map arbitrary class labels to contiguous indices for a specific channel.
 
@@ -72,11 +72,22 @@ def remap_labels(label: torch.Tensor, mapping: dict, channel_id: int = 0) -> tor
 
     # select the channel to remap
     channel_data = label_indexed[:, channel_id:channel_id+1] if label.dim() == 5 else label_indexed[channel_id:channel_id+1]
+    
+    # replace values that are truly unknown
+    unknown_values = [v for v in torch.unique(channel_data).cpu().numpy() if v not in mapping]
+    is_mask_unknown = False
+    if unknown_values:
+        # print (f"Unknown label values found: {unknown_values}, file: {label.meta['filename_or_obj']}")
+        is_mask_unknown = True
 
     # perform mapping
     orig_values = torch.tensor(sorted(mapping.keys()), device=label.device).contiguous()
     new_indices = torch.tensor([mapping[v.item()] for v in orig_values], device=label.device)
     flat_label = channel_data.flatten().contiguous()
+    if is_mask_unknown:
+        mask_unknown = ~torch.isin(flat_label, orig_values)
+        flat_label[mask_unknown] = default_class
+
     idx = torch.bucketize(flat_label, orig_values)
     flat_mapped = new_indices[idx]
     mapped_channel = flat_mapped.view(channel_data.shape)
@@ -118,9 +129,12 @@ class Transforms():
             LambdaD(keys=["label"], func=partial(remap_labels, mapping=original_to_index_map, channel_id=0))
             ]
         
+        self.pre_collate = [
+            RandSpatialCropSamplesD(keys=self.keys, roi_size=args.patch_size, random_size=False, num_samples=args.crop_samples)
+        ]
+               
         self.geometric_transforms = [
             RandLambdaD(keys=self.keys, prob=1.0, func=partial(move_to_device, device=device)), # make sure that data are on the correct gpu
-            RandSpatialCropSamplesD(keys=self.keys, roi_size=args.patch_size, random_size=False, num_samples=args.crop_samples),
             RandRotateD(keys=self.keys, range_x=args.rotation_range_xy, range_y=args.rotation_range_xy, range_z=args.rotation_range_z, prob=args.rotation_prob, mode=self.mode),
             RandZoomD(keys=self.keys, min_zoom=min_zoom, max_zoom=max_zoom, prob=args.zoom_prob, mode=self.mode) #anisotropic zoom
         ]
@@ -143,6 +157,9 @@ class Transforms():
                                        self.intensity_transforms + self.final_transform, 
                                        lazy=getattr(args, "lazy_interpolation", False))
         self.train_transform.set_random_state(seed=args.seed, state=np.random.RandomState(seed=args.seed))
+        
+        self.pre_collate_transform = Compose(self.pre_collate)
+        self.pre_collate_transform.set_random_state(seed=args.seed, state=np.random.RandomState(seed=args.seed))
         
         self.cpu_transform = Compose(self.preprocessing_transforms)
         self.gpu_transform = Compose(self.geometric_transforms + self.intensity_transforms + self.final_transform, lazy=getattr(args, "lazy_interpolation", False))

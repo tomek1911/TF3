@@ -15,11 +15,12 @@ args:
   comet: False
   print_config: False
   perform_test: False
-  debug_data_limit: -1
+  debug_data_limit: -1 #samples per datacenter: P, F, S, '-1' - no limit, use all data
   tags: null
   use_tqdm_print: True
   is_log_qualitative_2d: True
   is_log_qualitative_3d: False
+  run_validation : True
   validation_interval: 20
   log_batch_interval: 10
   log_metrics_interval: 10
@@ -36,9 +37,10 @@ args:
   visible_devices: 0,1
   cuda_device_id: 0
   parallel: False
-  gpu_frac: 1.0
+  gpu_frac: 0.99
   num_threads: 16
-  pin_memory: False
+  pin_memory: True
+  prefetch_factor: 2
 
 # --------------------------------------------------
 # Data & Preprocessing & Augmentation
@@ -49,12 +51,13 @@ args:
   watershed_maps_folder: deep_watershed_maps/distdir_maps
   cache_dir: data/cache
   clear_cache: False
-  val_items: 10
+  create_preproc_cache: False
+  val_items: 10 # validaiton samples per datacenter - 30 scans
   use_json_split: True
-  sampler_type: weighted #weighted, random, sequential
+  sampler_type: sequential #weighted, random, sequential
   use_thread_loader: False
-  pin_memory: True
-  num_workers: 8
+  num_workers_cache: 16
+  num_workers: 4
   use_persistent_dataset: True
   generate_watershed_maps: False
 
@@ -66,9 +69,9 @@ args:
   pixdim: 0.3
   houndsfield_clip: 3000
   patch_size: 
-    - 304
-    - 304
-    - 176
+    - 288
+    - 288
+    - 160
   crop_samples: 1
 
   # Geometric Augmentation
@@ -109,12 +112,11 @@ args:
 # --------------------------------------------------
 # Training Hyperparameters
 # --------------------------------------------------
-  epochs: 1001
-  batch_size: 1
+  epochs: 100
+  batch_size: 2
   batch_size_val: 1
   gradient_accumulation: 1
   lr: 1.0e-3
-  min_lr: 1.0e-6
   weight_decay: 1.0e-4
   optimizer: AdamW
   adam_eps: 1.0e-8
@@ -123,15 +125,21 @@ args:
   max_grad_norm: 1.0
   use_scaler: False
   autocast_dtype: float32
+  inference_autocast_dtype: float16
+  lsw: #loss_weights
+    seg_mlt: 1.0
+    dist: 10
+    direction: 1.0e-6
+    pulp: 1.0
 
 # --------------------------------------------------
 # Scheduler Settings
 # --------------------------------------------------
   scheduler_name: warmup_cosine #Options: cosine_annealing, warmup_cosine, warmup_cosine_restarts
-  warmup_steps: 10
+  warmup_steps: 0
   first_cycle_steps: 1.0    
   scheduler_gamma: 0.5
-  min_lr: 1.0e-6
+  min_lr: 1.0e-5
 
 # --------------------------------------------------
 # Loss & Metrics
@@ -150,9 +158,9 @@ args:
 # --------------------------------------------------
 # Checkpointing & Resume
 # --------------------------------------------------
-  save_checkpoints: False
-  checkpoint_dir: experiments
-  save_interval: 100
+  save_checkpoints: True
+  checkpoint_dir: checkpoints
+  save_interval: 5
   save_optimiser_interval: 200
   save_optimizer: True           
   start_epoch: 0

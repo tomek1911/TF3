@@ -107,7 +107,8 @@ class DWNet(nn.Module):
         
         seg_multiclass = self.multiclass_decoder(torch.cat([seg, features[-1]], dim=1))
         dist = self.dist_decoder(torch.cat([x, features[-1]], dim=1)) 
-        dir = self.direction_decoder(torch.cat([x, features[-1]], dim=1))
+        direction = self.direction_decoder(torch.cat([x, features[-1]], dim=1))
+        direction = f.normalize(direction, p=2.0, dim=1)
         pulp = self.pulp_decoder(torch.cat([x, features[-1]], dim=1))
         
         # if self.is_edt:
@@ -121,7 +122,7 @@ class DWNet(nn.Module):
         #     edt = self._get_cached_zeros((B, 1, *s_dim), x.device)
         #     edt_direction = self._get_cached_zeros((B, 3, *s_dim), x.device)
 
-        return seg_multiclass, dist, dir, pulp
+        return seg_multiclass, dist, direction, pulp
         
 if __name__ == "__main__":
     
@@ -131,6 +132,12 @@ if __name__ == "__main__":
     from monai.inferers import sliding_window_inference
     backbone_name = 'resnet34'
     device = "cuda:0"
+    
+    total_memory_bytes = torch.cuda.get_device_properties(device).total_memory  # in bytes
+    limit_bytes = 15.5 * 1024**3  # 15.5 GiB
+    fraction = limit_bytes / total_memory_bytes
+    torch.cuda.set_per_process_memory_fraction(fraction, device=device)
+
     model = DWNet(spatial_dims=3,
                   in_channels=1,
                   out_channels=46,  # 10 anatomical classes + 32 tooth classes + 3 canal classes + 1 pulp
@@ -138,7 +145,7 @@ if __name__ == "__main__":
                   norm='instance',
                   bias=False,
                   backbone_name=backbone_name,
-                  configuration='EDT_DIR'
+                  configuration='DIST_DIR_PULP'
                   ).to(device)
 
     pytorch_total_params = sum(p.numel() for p in model.parameters())
@@ -149,8 +156,8 @@ if __name__ == "__main__":
     batch_size = 1
     # input = torch.rand(batch_size,1,256,256,160).to(device)
     # input = torch.rand(1,1,512, 512, 300).to(device)
-    input = torch.rand(1,1,371,362,191).to(device)
-    patch_size = (304,304,176)
+    input = torch.rand(batch_size,1,371,362,191).to(device)
+    patch_size = (288,288,160)
     
     print(f"Model input: {input.shape}, patch_size: {patch_size}, encoder name: {backbone_name}, device: {device}.\n")
     
@@ -183,6 +190,6 @@ if __name__ == "__main__":
             
         print(f"Total test time: {(time.time()-start_total):.2f} s")
         print(f"Forward pass avg. time: {np.array(time_acc).mean():.2f} ms")
-        print(f" - Allocated gpu avg. memory: {np.array(memory_alloc_acc).mean():.2f} GB")
-        print(f" - Reserved gpu memory: {np.array(memory_reserved_acc).max():.2f} GB")
-        print(f" - MAX allocated gpu memory: {np.array(memory_max_alloc_acc).max():.2f} GB")
+        print(f" - Allocated gpu avg. memory: {np.array(memory_alloc_acc).mean():.2f} GiB")
+        print(f" - Reserved gpu memory: {np.array(memory_reserved_acc).max():.2f} GiB")
+        print(f" - MAX allocated gpu memory: {np.array(memory_max_alloc_acc).max():.2f} GiB")

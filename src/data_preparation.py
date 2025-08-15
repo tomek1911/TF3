@@ -1,4 +1,5 @@
 import os
+import random
 import json
 import re
 import torch
@@ -57,11 +58,23 @@ def split_train_val(args):
     val_files = []
     train_files = []
     for device, files in device_files.items():
-        val_files.extend(files[:args.val_items])
+        #random sample out of list
+        val_indices = set(random.sample(range(len(files)), args.val_items))
+        val_files.extend([f for i, f in enumerate(files) if i in val_indices])
+        # remaining files after validation
+        remaining_files = [f for i, f in enumerate(files) if i not in val_indices]
+
         if args.debug_data_limit != -1:
-            train_files.extend(files[args.val_items:args.debug_data_limit])
+            train_files.extend(random.sample(remaining_files, min(args.debug_data_limit, len(remaining_files))))
         else:
-            train_files.extend(files[args.val_items:])
+            train_files.extend(remaining_files)
+        
+        #non-random choice
+        # val_files.extend(files[:args.val_items])
+        # if args.debug_data_limit != -1:
+        #     train_files.extend(files[args.val_items:args.val_items+args.debug_data_limit])
+        # else:
+        #     train_files.extend(files[args.val_items:])
         
     # Pair image and label files - remove '_0000.nii.gz' from image filenames to match label filenames
     def pair_files(file_list):

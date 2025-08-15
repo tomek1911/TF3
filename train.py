@@ -46,6 +46,7 @@ import time
 import warnings
 import numpy as np
 from tqdm import tqdm
+from functools import partial
 from datetime import datetime
 from contextlib import contextmanager
 from torch.utils.data._utils.collate import default_collate
@@ -57,6 +58,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import SubsetRandomSampler, WeightedRandomSampler
+from torch.nn import MSELoss
 
 #MONAI modules
 from monai.losses import DiceLoss
@@ -71,14 +73,54 @@ from monai.utils import set_determinism
 from monai.inferers import sliding_window_inference
 from monai.networks.utils import one_hot
 from PIL import Image
+from monai.data.utils import collate_meta_tensor 
 
 from src.cuda_setup import configure_cuda
 from src.data_preparation import split_train_val, create_domain_labels, build_sampler, load_dataset_json
 from src.model import DWNet
 from src.scheduler import CosineAnnealingWarmupRestarts, WarmupCosineSchedule
-from src.losses import DiceCELoss, DiceFocalLoss
+from src.losses import DiceCELoss, DiceFocalLoss, AngularLoss, FocalDiceBCELoss
 from src.transforms import Transforms
 from src.logger import DummyExperiment
+from src.deep_watershed import deep_watershed_with_voting
+from src.inference_utils import save_float_map, save_inference_multiclass_segmentation
+
+def collate_meta_tensor_with_crop(batch, transforms):
+    processed_batch = []
+    for sample in batch:
+        sample = transforms(sample)
+        processed_batch.append(sample)
+    return collate_meta_tensor(processed_batch)
+
+
+def merge_pulp_into_teeth(multiclass_pred: np.ndarray, pulp_pred: np.ndarray, pulp_class: int = 111, excluded_classes=None) -> np.ndarray:
+    """
+    Merge pulp segmentation into teeth predictions.
+    
+    Args:
+        teeth_pred: 3D array of teeth instance predictions (e.g., from deep watershed)
+        pulp_pred: 3D array of binary pulp segmentation (1 = pulp, 0 = background)
+        pulp_class: integer label to assign to pulp voxels inside teeth (default=111)
+        excluded_classes: list of class labels to exclude from teeth mask
+    
+    Returns:
+        merged_pred: 3D array with pulp merged into teeth, respecting tooth mask
+    """
+    if excluded_classes is None:
+        excluded_classes = list(range(0, 11)) + [43, 44, 45]
+        
+    merged_pred = multiclass_pred.copy()
+    
+    # Mask: valid teeth voxels (not in excluded classes)
+    teeth_mask = ~np.isin(multiclass_pred, excluded_classes)
+    
+    # Only keep pulp inside valid teeth
+    pulp_inside_teeth = (pulp_pred > 0) & teeth_mask
+    
+    # Assign pulp class
+    merged_pred[pulp_inside_teeth] = pulp_class
+    
+    return merged_pred
 
 def setup_training(args):
     
@@ -105,15 +147,15 @@ def setup_training(args):
 
     # Average mixed precision settings, default to torch.float32
     scaler = None
-    autocast_d_type = torch.float32 
-    if args.use_scaler:
-        TORCH_DTYPES = {
-        'bfloat16': torch.bfloat16,    
-        'float16': torch.float16,     
+    TORCH_DTYPES = {
+        'bfloat16': torch.bfloat16,
+        'float16': torch.float16,
         'float32': torch.float32
-        }
+    }
+    autocast_d_type = TORCH_DTYPES[args.autocast_dtype]
+    val_autocast_d_type = TORCH_DTYPES[args.inference_autocast_dtype]
+    if args.use_scaler:
         scaler = torch.amp.GradScaler()
-        autocast_d_type=TORCH_DTYPES[args.autocast_dtype]
         if autocast_d_type == torch.bfloat16:
             # detect gradient errors - debug cuda C code
             os.environ["TORCH_CUDNN_V8_API_ENABLED"]="1"
@@ -128,7 +170,7 @@ def setup_training(args):
         device = torch.device("cpu")
 
     #DATA CACHE
-    args.cache_path = os.path.join(args.cache_dir, f"b_{args.batch_size}_p_{args.patch_size[0]}_{args.patch_size[1]}_{args.patch_size[2]}")
+    args.cache_path = os.path.join(args.cache_dir, f"p_{args.patch_size[0]}_{args.patch_size[1]}_{args.patch_size[2]}")
     if not os.path.exists(args.cache_path):
         os.makedirs(args.cache_path)
 
@@ -153,17 +195,24 @@ def setup_training(args):
                 os.remove(file)
         print(f"Cleared cache in dir: {args.cache_path}, train: {len(train_cache)} files, val: {len(val_cache)} files, test: {len(test_cache)} files.")
 
-    return scaler, autocast_d_type, device
+    return scaler, autocast_d_type, val_autocast_d_type, device
 
-def training_step(args, loss_fn, batch_idx, epoch, model, optimizer, scaler, data_sample, train_loader, logger, experiment, autocast_d_type, device):
+def training_step(args, losses, batch_idx, epoch, model, optimizer, scaler, data_sample, train_loader, logger, experiment, autocast_d_type, device, pbar):
+    # pass
     # print(f"batch size: {args.batch_size}, batch_idx: {batch_idx}, \
     #       image: {data_sample['image'].shape}, label: {data_sample['label'].shape}, watershed_map: {data_sample['watershed_map'].shape} \
     #       source: {data_sample['image'].meta['filename_or_obj']}.")
     with torch.amp.autocast(enabled=args.use_scaler, dtype=autocast_d_type, device_type=device.type):
         output = model(data_sample["image"])
-        (seg_multiclass, dist, dir, pulp) = output
-        multiclass_dice_loss, ce_loss = loss_fn(seg_multiclass, data_sample["label"][:,0:1]) #primary labels - no pulp loss
-        loss = multiclass_dice_loss + ce_loss
+        # unpack output
+        (seg_multiclass, dist, direction, pulp) = output
+        
+        #loss
+        multiclass_dice_loss, ce_loss = losses['multiclass_seg'](seg_multiclass, data_sample["label"][:,0:1]) #primary labels - no pulp loss
+        dist_loss = losses['dist_mse'](dist, data_sample["watershed_map"][:,0:1])
+        dir_loss = losses['dir_loss'](direction, data_sample["watershed_map"][:,1:], torch.where(data_sample["label"][:,0:1].long() >= 1, 1, 0))
+        pulp_loss = losses['pulp_loss'](pulp, data_sample["label"][:,1:])  #pulp labels
+        loss = (multiclass_dice_loss + ce_loss) * args.lsw['seg_mlt'] + dist_loss * args.lsw['dist'] + dir_loss * args.lsw['direction'] + pulp_loss * args.lsw['pulp']
         
         if args.use_scaler and scaler is not None:
             scaler.scale(loss).backward()
@@ -178,22 +227,45 @@ def training_step(args, loss_fn, batch_idx, epoch, model, optimizer, scaler, dat
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm, norm_type=2.0)
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
     
     #get predictions
     #log metrics
     #log qualitative results
     
 # INFERENCE STEP
-def inference_step(args, batch_idx, epoch, model, scaler, data_sample, data_loader, experiment, autocast_d_type, device):
-    with warnings.catch_warnings(), torch.amp.autocast(enabled=args.use_scaler, dtype=autocast_d_type):
+def inference_step(args, batch_idx, epoch, model, scaler, data_sample, data_loader, experiment, autocast_d_type, device, pbar, trans):
+    with warnings.catch_warnings(), torch.amp.autocast(enabled=True, dtype=autocast_d_type, device_type=device.type):
         pass
-        #  output = sliding_window_inference(data_sample["image"], roi_size=args.patch_size, sw_batch_size=8, predictor=model, 
-        #                                     overlap=0.5, sw_device=device, device=device, mode='gaussian', sigma_scale=0.125,
-        #                                     padding_mode='constant', cval=0, progress=False)
-    #get predictions
-    #log metrics
-    #log qualitative results
-
+        # output = sliding_window_inference(data_sample["image"], roi_size=args.patch_size, sw_batch_size=4, predictor=model, 
+        #                                   overlap=0.5, sw_device=device, device='cpu', mode='gaussian', sigma_scale=0.125,
+        #                                   padding_mode='constant', cval=0, progress=False)
+    
+    # (seg_multiclass, dist, direction, pulp) = output
+    # multiclass_segmentation = AsDiscrete(argmax=True)(torch.softmax(seg_multiclass, dim=1)[0]).squeeze().cpu().numpy()
+    # pulp_segmentation = AsDiscrete(threshold=0.5)(torch.sigmoid(pulp)).squeeze().cpu().numpy()
+    # dist = nn.Threshold(1e-3, 0)(dist).squeeze().cpu().numpy()
+    # #prediction
+    # pred_multiclass = deep_watershed_with_voting(dist, multiclass_segmentation)
+    # pred_final = merge_pulp_into_teeth(pred_multiclass, pulp_segmentation, pulp_class=111)
+    #oracle
+    # pred_multiclass = deep_watershed_with_voting(data_sample["watershed_map"][0, 0:1].squeeze().cpu().numpy(), data_sample["label"][0, 0:1].squeeze().cpu().numpy())
+    # pred_final = merge_pulp_into_teeth(pred_multiclass, data_sample["label"][0, 1:].squeeze().cpu().numpy(), pulp_class=111)
+    
+    # scan_name = data_sample['label'].meta['filename_or_obj'].split(
+    #     '/')[-1].replace('.nii.gz', '')
+    # save_float_map("output/direction_map", scan_name, dist,
+    #                trans.invert_inference_transform, data_sample['image'], 'dist', np.float32)
+    # save_float_map("output/distance_map", scan_name, direction, 
+    #                trans.invert_inference_transform, data_sample['image'], 'dir', np.float32)
+    # save_float_map("output/pulp", scan_name, pulp_segmentation,
+    #                trans.invert_inference_transform, data_sample['image'], 'pulp', np.uint8)
+    # save_inference_multiclass_segmentation("output/multiclass_seg", scan_name, multiclass_segmentation,
+    #                                        trans.invert_inference_transform, data_sample['image'])
+    # save_inference_multiclass_segmentation("output/final_pred", scan_name, pred_final,
+    #                                        trans.invert_inference_transform, data_sample['image'], is_invert_mapping=False)
+    
+    
 _builtin_print = builtins.print  # store the original print
 
 @contextmanager
@@ -217,7 +289,7 @@ def use_tqdm_print(args=None):
 
 def main():
     #load experiment configurations, setup cuda
-    scaler, autocast_d_type, device = setup_training(args)
+    scaler, autocast_d_type, val_autocast_d_type, device = setup_training(args)
     
     #setup experiment and logger
     if args.comet:
@@ -227,8 +299,8 @@ def main():
     else:
         experiment = DummyExperiment()
         unique_experiment_name = uuid.uuid4().hex
-        args.batch_size=1
-        args.validation_interval = 10
+        # args.batch_size=1
+        args.validation_interval = 5
         args.log_batch_interval = 5
         args.log_metrics_interval = 5
         args.multiclass_metrics_interval = 5
@@ -236,7 +308,6 @@ def main():
         args.log_slice_interval = 1
         args.log_3d_scene_interval_training = 5
         args.log_3d_scene_interval_validation = 5
-        args.debug_data_limit = -1
         
     #TODO add logger    
     logger = None
@@ -263,7 +334,9 @@ def main():
     trans=Transforms(args, device=device)
     
     if args.use_persistent_dataset:
-        train_dataset = PersistentDataset(data=train_data, transform=trans.cpu_transform, cache_dir=os.path.join(args.cache_path, 'train'))
+        pre_cache_train_dataset = PersistentDataset(data=train_data, transform=trans.preprocessing_transforms, cache_dir=os.path.join(args.cache_path, 'train'))
+        train_transform = trans.train_transform if args.use_thread_loader else trans.preprocessing_transforms
+        train_dataset = PersistentDataset(data=train_data, transform=train_transform, cache_dir=os.path.join(args.cache_path, 'train'))
         val_dataset = PersistentDataset(data=val_data, transform=trans.inference_transform, cache_dir=os.path.join(args.cache_path, 'val'))
     else:
         # Your normal Dataset class expects list of filenames or similar
@@ -272,17 +345,17 @@ def main():
 
     train_sampler = build_sampler(train_dataset, train_labels, args)
     val_sampler = build_sampler(val_dataset, val_labels, args)
-        
+    
+    pre_cache_loader = DataLoader(pre_cache_train_dataset, num_workers=args.num_workers_cache, batch_size=1, sampler=train_sampler, pin_memory=False)
+    
     if args.use_thread_loader:
         train_loader = ThreadDataLoader(train_dataset, use_thread_workers=True, buffer_size=1, batch_size=args.batch_size, sampler=train_sampler)
         val_loader = ThreadDataLoader(val_dataset, use_thread_workers=True, buffer_size=1, batch_size=args.batch_size_val, sampler=val_sampler)
-        # test_loader_A = ThreadDataLoader(test_dataset, use_thread_workers=True, buffer_size=1, batch_size=args.batch_size_val, sampler=list(range(0,11)))
-        # test_loader_B = ThreadDataLoader(test_dataset, use_thread_workers=True, buffer_size=1, batch_size=args.batch_size_val, sampler=list(range(11,20)))
     else:
-        train_loader = DataLoader(train_dataset, num_workers=args.num_workers, batch_size=args.batch_size, sampler=train_sampler, pin_memory=args.pin_memory, worker_init_fn=np.random.seed(args.seed))
+        train_loader = DataLoader(train_dataset, num_workers=args.num_workers, batch_size=args.batch_size, sampler=train_sampler, persistent_workers=False,
+                                  pin_memory=args.pin_memory, worker_init_fn=np.random.seed(args.seed), prefetch_factor=args.prefetch_factor,
+                                  collate_fn=partial(collate_meta_tensor_with_crop, transforms=trans.pre_collate_transform)) #collate after random crop - to enable batches
         val_loader = DataLoader(val_dataset, num_workers=args.num_workers, batch_size=args.batch_size_val, sampler=val_sampler, pin_memory=args.pin_memory)
-        # test_loader_A = DataLoader(test_dataset, num_workers=args.num_workers, batch_size=args.batch_size_val, sampler=list(range(0,11)))
-        # test_loader_B = DataLoader(test_dataset, num_workers=args.num_workers,batch_size=args.batch_size_val, sampler=list(range(11,20)))
     
     #setup model, optimizer, scheduler, losses, metrics
     #MODEL
@@ -310,6 +383,16 @@ def main():
         criterion_seg = DiceCELoss(include_background=args.include_background_loss, ce_weight=weights, to_onehot_y=True, softmax=True)
     elif args.seg_loss_name=="FocalDice":
         criterion_seg = DiceFocalLoss(include_background=args.include_background_loss, focal_weight=weights, to_onehot_y=True, softmax=True, gamma=args.wasserstein_distance_matrix)
+
+    criterion_distance = MSELoss()
+    criterion_direction = AngularLoss()
+    criterion_pulp = FocalDiceBCELoss(alpha=0.5, gamma=1.5, bce_weight=5)
+        
+    losses = {"multiclass_seg": criterion_seg,
+              "dist_mse": criterion_distance,
+              "dir_loss": criterion_direction,
+              "pulp_loss": criterion_pulp
+              }
     
     #OPTIMIZER
     if args.optimizer == "SGD":
@@ -407,177 +490,212 @@ def main():
     #Setup print
     disable_tqdm = not sys.stderr.isatty()
     
+    if args.create_preproc_cache:
+        start_time_epoch = time.time()
+        for train_data in tqdm(pre_cache_loader, desc=f"Cache persistent dataset", total=len(pre_cache_loader),
+                               file=sys.stderr, position=1, leave=False, disable=disable_tqdm):
+            continue
+        cache_time=time.time() - start_time_epoch
+        print(f"Pre-cache took: {cache_time:.2f}s.")
+        
     for epoch in tqdm(range(args.start_epoch, args.epochs), desc="Epochs", file=sys.stderr,
                       position=0, leave=True, disable=disable_tqdm):
         print(f"Starting epoch {epoch + 1}")
         model.train()
         #TRAINING LOOP
         start_time_epoch = time.time()
+        pbar = tqdm(enumerate(train_loader), desc=f"Training (epoch {epoch+1})", total=len(train_loader),
+                    file=sys.stderr, position=1, leave=False, disable=disable_tqdm)
         with use_tqdm_print(args.use_tqdm_print):
-            for batch_idx, train_data in tqdm(enumerate(train_loader), desc=f"Training (epoch {epoch+1})", total=len(train_loader),
-                                            file=sys.stderr, position=1, leave=False, disable=disable_tqdm):
+            for batch_idx, train_data in pbar:
                 #Separate cpu and gpu
-                batch_list = []
-                batch_size = train_data["image"].shape[0]
-                for i in range(batch_size):
-                    sample = {k: v[i] for k, v in train_data.items()}
-                    sample = trans.gpu_transform(sample)  # apply GPU transforms per sample
-                    batch_list.append(sample)
-                train_data = default_collate(batch_list)[0]
-                training_step(args, criterion_seg, batch_idx, epoch, model, optimizer, scaler, train_data, train_loader, 
-                            logger, experiment, autocast_d_type, device)
+                if not args.use_thread_loader:
+                    batch_list = []
+                    train_data = train_data[0]
+                    batch_size = train_data["image"].shape[0]
+                    for i in range(batch_size):
+                        sample = {k: v[i] for k, v in train_data.items()}
+                        sample = trans.gpu_transform(sample)  # apply GPU transforms per sample
+                        batch_list.append(sample)
+                    train_data = default_collate(batch_list)
+                training_step(args, losses, batch_idx, epoch, model, optimizer, scaler, train_data, train_loader, 
+                            logger, experiment, autocast_d_type, device, pbar)
+        # update scheduler at the end of the training epoch
+        scheduler.step()
         epoch_time=time.time() - start_time_epoch
         print(f" Train loop finished - total time: {epoch_time:.2f}s.")
 
         #RESET METRICS after training step
-        if args.classes > 1:
-            _ = [func.reset() for func in seg_metrics]
-            _ = [func.reset() for func in edt_reg_metrics]
-            if (epoch+1) >= args.multiclass_metrics_epoch and (epoch+1) % args.multiclass_metrics_interval == 0:
-                _ = [func.reset() for func in seg_metrics_multiclass]
-        else:
-            _ = [func.reset() for func in seg_metrics_binary]
+        # if args.classes > 1:
+        #     _ = [func.reset() for func in seg_metrics]
+        #     _ = [func.reset() for func in edt_reg_metrics]
+        #     if (epoch+1) >= args.multiclass_metrics_epoch and (epoch+1) % args.multiclass_metrics_interval == 0:
+        #         _ = [func.reset() for func in seg_metrics_multiclass]
+        # else:
+        #     _ = [func.reset() for func in seg_metrics_binary]
 
         #VALIDATION
-        model.eval()
-        if (epoch+1) % args.validation_interval == 0 and epoch != 0:
+
+        if (epoch+1) % args.validation_interval == 0 and epoch != 0 and args.run_validation:
+            
             print("Starting validation...")
             start_time_validation = time.time()
-            for batch_idx, val_data in enumerate(val_loader):
-                with torch.no_grad():
-                    inference_step(args, batch_idx, epoch, model, scaler, val_data, val_loader, experiment, autocast_d_type, device)
+            pbar = tqdm(enumerate(val_loader), desc=f"Validation epoch {epoch+1})", total=len(val_loader),
+                    file=sys.stderr, position=1, leave=False, disable=disable_tqdm)
+            model.eval()
+            with use_tqdm_print(args.use_tqdm_print):
+                for batch_idx, val_data in pbar:
+                    with torch.no_grad():
+                        inference_step(args, batch_idx, epoch, model, scaler, val_data, val_loader, experiment, val_autocast_d_type, device, pbar, trans)
             val_time=time.time() - start_time_validation
             print( f"Validation time: {val_time:.2f}s")
                     
-            #RESET METRICS after validation step
-            if args.classes > 1:
-                _ = [func.reset() for func in seg_metrics]
-                _ = [func.reset() for func in edt_reg_metrics]
-                if (epoch+1) >= args.multiclass_metrics_epoch and (epoch+1) % args.multiclass_metrics_interval == 0:
-                    _ = [func.reset() for func in seg_metrics_multiclass]
-            else:
-                _ = [func.reset() for func in seg_metrics_binary]
+            # #RESET METRICS after validation step
+            # if args.classes > 1:
+            #     _ = [func.reset() for func in seg_metrics]
+            #     _ = [func.reset() for func in edt_reg_metrics]
+            #     if (epoch+1) >= args.multiclass_metrics_epoch and (epoch+1) % args.multiclass_metrics_interval == 0:
+            #         _ = [func.reset() for func in seg_metrics_multiclass]
+            # else:
+            #     _ = [func.reset() for func in seg_metrics_binary]
 
-            #aggregate metrics after validation step
-            val_metrics_agg = [cum.aggregate() for cum in val_metrics_cms]
-            val_metrics_multiclass_agg = val_dice_multiclass_cum.aggregate()
+            # #aggregate metrics after validation step
+            # val_metrics_agg = [cum.aggregate() for cum in val_metrics_cms]
+            # val_metrics_multiclass_agg = val_dice_multiclass_cum.aggregate()
             
-            #AGGREGATE RUNNING AVERAGES
-            train_loss_agg = [cum.aggregate() for cum in training_loss_cms]
-            if (epoch+1) % args.log_metrics_interval == 0:
-                train_metrics_agg = [cum.aggregate() for cum in training_metrics_cms]
-            if (epoch+1) >= args.multiclass_metrics_epoch and (epoch+1) % args.multiclass_metrics_interval == 0:
-                train_dice_multiclass_agg = train_dice_multiclass_cum.aggregate()
-                train_dice_multiclass_cum.reset()
-                experiment.log_metric("train_dice_multiclass", train_dice_multiclass_agg, epoch=epoch)
-                if (epoch+1) % args.validation_interval == 0:
-                    val_dice_multiclass_agg = val_dice_multiclass_cum.aggregate()
-                    val_dice_multiclass_cum.reset()
-                    experiment.log_metric("val_dice_multiclass", val_dice_multiclass_agg, epoch=epoch)
-            else:
-                train_dice_multiclass_agg = 0.0
-                val_dice_multiclass_agg = 0.0
+            # #AGGREGATE RUNNING AVERAGES
+            # train_loss_agg = [cum.aggregate() for cum in training_loss_cms]
+            # if (epoch+1) % args.log_metrics_interval == 0:
+            #     train_metrics_agg = [cum.aggregate() for cum in training_metrics_cms]
+            # if (epoch+1) >= args.multiclass_metrics_epoch and (epoch+1) % args.multiclass_metrics_interval == 0:
+            #     train_dice_multiclass_agg = train_dice_multiclass_cum.aggregate()
+            #     train_dice_multiclass_cum.reset()
+            #     experiment.log_metric("train_dice_multiclass", train_dice_multiclass_agg, epoch=epoch)
+            #     if (epoch+1) % args.validation_interval == 0:
+            #         val_dice_multiclass_agg = val_dice_multiclass_cum.aggregate()
+            #         val_dice_multiclass_cum.reset()
+            #         experiment.log_metric("val_dice_multiclass", val_dice_multiclass_agg, epoch=epoch)
+            # else:
+            #     train_dice_multiclass_agg = 0.0
+            #     val_dice_multiclass_agg = 0.0
                     
             #reset running averages
-            _ = [cum.reset() for cum in training_loss_cms]
-            _ = [cum.reset() for cum in training_metrics_cms]
-            if (epoch+1) % args.validation_interval == 0:
-                _ = [cum.reset() for cum in val_metrics_cms]
+            # _ = [cum.reset() for cum in training_loss_cms]
+            # _ = [cum.reset() for cum in training_metrics_cms]
+            # if (epoch+1) % args.validation_interval == 0:
+            #     _ = [cum.reset() for cum in val_metrics_cms]
             
-            #TEST
-            if args.perform_test:
-                #TODO add test
-                for batch_idx, test_sample in enumerate(...):
-                    with torch.no_grad():
-                        inference_step(args, batch_idx, epoch, model, test_sample, test_loader, log, experiment,
-                                        seg_metrics_binary, val_dice_cum, val_hd_cum, autocast_d_type, device)
-
-        scheduler.step()
+            # #TEST
+            # if args.perform_test:
+            #     #TODO add test
+            #     for batch_idx, test_sample in enumerate(...):
+            #         with torch.no_grad():
+            #             inference_step(args, batch_idx, epoch, model, test_sample, test_loader, log, experiment,
+            #                             seg_metrics_binary, val_dice_cum, val_hd_cum, autocast_d_type, device)
+                        
         #LOG METRICS TO COMET
         # CHECKPOINTS SAVE
         if args.save_checkpoints:
             #create unique experiment name
-            directory = f"checkpoints/{args.checkpoint_dir}/{unique_experiment_name}/classes_{str(args.classes)}_{args.seg_loss_name}"
+            directory = f"checkpoints/{args.checkpoint_dir}/{unique_experiment_name}/"
             if not os.path.exists(directory):
                 os.makedirs(directory)
-                
+            
+            # save config to YAML
+            config_path = os.path.join(directory, "config.yaml")
+            with open(config_path, "w") as f:
+                yaml.safe_dump(vars(args), f)
+            
+            
+            # save model checkpoint
+            if (epoch + 1) % args.save_interval == 0 and epoch != 0:
+                ckpt_path = os.path.join(directory, f"model_epoch_{epoch+1}.pth")
+                torch.save({
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+                    'experiment_name': unique_experiment_name,
+                }, ckpt_path)
+                print(f"Checkpoint saved.")
+                    
             # save best TRAIN model
-            if (epoch+1) % args.log_metrics_interval == 0:
-                if best_dice_score < train_metrics_agg[0]:
-                    save_path = f"{directory}/model-{args.model_name}-{args.classes}class-current_best_train.pt"
-                    torch.save({
-                            'epoch': (epoch),
-                            'model_state_dict': model.state_dict(),
-                            'model_train_dice': train_metrics_agg[0],
-                            'model_train_hd': train_metrics_agg[2],
-                            'experiment_name': unique_experiment_name,
-                            'experiment_key': experiment.get_key()
-                            }, save_path)
-                    best_dice_score = train_metrics_agg[0]
-                    print(f"Current best train dice score {best_dice_score:.4f}. Model saved!")
+            # if (epoch+1) % args.log_metrics_interval == 0:
+            #     if best_dice_score < train_metrics_agg[0]:
+            #         save_path = f"{directory}/model-{args.model_name}-{args.classes}class-current_best_train.pt"
+            #         torch.save({
+            #                 'epoch': (epoch),
+            #                 'model_state_dict': model.state_dict(),
+            #                 'model_train_dice': train_metrics_agg[0],
+            #                 'model_train_hd': train_metrics_agg[2],
+            #                 'experiment_name': unique_experiment_name,
+            #                 'experiment_key': experiment.get_key()
+            #                 }, save_path)
+            #         best_dice_score = train_metrics_agg[0]
+            #         print(f"Current best train dice score {best_dice_score:.4f}. Model saved!")
                             
             # save best VALIDATION score
-            if (epoch+1) % args.validation_interval == 0:
-                if best_dice_val_score < val_metrics_agg[0]:
-                    save_path = f"{directory}/model-{args.model_name}-{args.classes}class-current_best_val.pt"
-                    torch.save({
-                        'epoch': (epoch),
-                        'model_state_dict': model.state_dict(),
-                        'model_val_dice': val_metrics_agg[0],
-                        'model_val_hd': val_metrics_agg[2],
-                        'model_val_dice_multiclass': val_dice_multiclass_agg,
-                        'experiment_name': unique_experiment_name,
-                        'experiment_key': experiment.get_key()
-                        }, save_path)
-                    best_dice_val_score = val_metrics_agg[0]
-                    print(f"Current best binary segmentation validation dice score {best_dice_val_score:.4f}. Model saved!")
-                if best_dice_multiclass_val_score < val_metrics_multiclass_agg:
-                    save_path = f"{directory}/model-{args.model_name}-{args.classes}class-current_best_multiclass_val.pt"
-                    torch.save({
-                        'epoch': (epoch),
-                        'model_state_dict': model.state_dict(),
-                        'model_val_dice': val_metrics_agg[0],
-                        'model_val_hd': val_metrics_agg[2],
-                        'model_val_dice_multiclass': val_dice_multiclass_agg,
-                        'experiment_name': unique_experiment_name,
-                        'experiment_key': experiment.get_key()
-                        }, save_path)
-                    best_dice_multiclass_val_score = val_metrics_multiclass_agg
-                    print(f"Current best multiclass segmentation validation dice score {best_dice_multiclass_val_score:.4f}. Model saved!")
+            # if (epoch+1) % args.validation_interval == 0:
+            #     if best_dice_val_score < val_metrics_agg[0]:
+            #         save_path = f"{directory}/model-{args.model_name}-{args.classes}class-current_best_val.pt"
+            #         torch.save({
+            #             'epoch': (epoch),
+            #             'model_state_dict': model.state_dict(),
+            #             'model_val_dice': val_metrics_agg[0],
+            #             'model_val_hd': val_metrics_agg[2],
+            #             'model_val_dice_multiclass': val_dice_multiclass_agg,
+            #             'experiment_name': unique_experiment_name,
+            #             'experiment_key': experiment.get_key()
+            #             }, save_path)
+            #         best_dice_val_score = val_metrics_agg[0]
+            #         print(f"Current best binary segmentation validation dice score {best_dice_val_score:.4f}. Model saved!")
+            #     if best_dice_multiclass_val_score < val_metrics_multiclass_agg:
+            #         save_path = f"{directory}/model-{args.model_name}-{args.classes}class-current_best_multiclass_val.pt"
+            #         torch.save({
+            #             'epoch': (epoch),
+            #             'model_state_dict': model.state_dict(),
+            #             'model_val_dice': val_metrics_agg[0],
+            #             'model_val_hd': val_metrics_agg[2],
+            #             'model_val_dice_multiclass': val_dice_multiclass_agg,
+            #             'experiment_name': unique_experiment_name,
+            #             'experiment_key': experiment.get_key()
+            #             }, save_path)
+            #         best_dice_multiclass_val_score = val_metrics_multiclass_agg
+            #         print(f"Current best multiclass segmentation validation dice score {best_dice_multiclass_val_score:.4f}. Model saved!")
 
             #save based on SAVE INTERVAL
-            if (epoch+1) % args.save_interval == 0 and epoch != 0:
-                save_path = f"{directory}/model-{args.model_name}-{args.classes}class_val_{val_metrics_agg[0]:.4f}_train_{train_metrics_agg[0]:.4f}_epoch_{(epoch):04}.pt"
-                #save based on optimizer save interval - allows to continue training
-                if args.save_optimizer and epoch % args.save_optimiser_interval == 0 and epoch != 0:
-                    torch.save({
-                        'epoch': (epoch),
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict' : scheduler.state_dict(),
-                        'model_train_dice': train_metrics_agg[0],
-                        'model_train_hd': train_metrics_agg[2],
-                        'model_val_dice': val_metrics_agg[0],
-                        'model_val_hd': val_metrics_agg[2],
-                        'experiment_name': unique_experiment_name,
-                        'experiment_key': experiment.get_key()
-                        }, save_path)
-                    print("Saved optimizer and scheduler state dictionaries.")
-                else:
-                    torch.save({
-                        'epoch': (epoch),
-                        'model_state_dict': model.state_dict(),
-                        'model_train_dice': train_metrics_agg[0],
-                        'model_train_hd': train_metrics_agg[2],
-                        'model_val_dice': val_metrics_agg[0],
-                        'model_val_hd': val_metrics_agg[2],
-                        'experiment_name': unique_experiment_name,
-                        'experiment_key': experiment.get_key()
-                        }, save_path)
-                    print(f"Interval model saved! - train_dice: {train_metrics_agg[0]:.4f}, val_dice: {val_metrics_agg[0]:.4f}, best_val_dice: {best_dice_val_score:.4f}.")
+            # if (epoch+1) % args.save_interval == 0 and epoch != 0:
+            #     save_path = f"{directory}/model-{args.model_name}-{args.classes}class_val_{val_metrics_agg[0]:.4f}_train_{train_metrics_agg[0]:.4f}_epoch_{(epoch):04}.pt"
+            #     #save based on optimizer save interval - allows to continue training
+            #     if args.save_optimizer and epoch % args.save_optimiser_interval == 0 and epoch != 0:
+            #         torch.save({
+            #             'epoch': (epoch),
+            #             'model_state_dict': model.state_dict(),
+            #             'optimizer_state_dict': optimizer.state_dict(),
+            #             'scheduler_state_dict' : scheduler.state_dict(),
+            #             'model_train_dice': train_metrics_agg[0],
+            #             'model_train_hd': train_metrics_agg[2],
+            #             'model_val_dice': val_metrics_agg[0],
+            #             'model_val_hd': val_metrics_agg[2],
+            #             'experiment_name': unique_experiment_name,
+            #             'experiment_key': experiment.get_key()
+            #             }, save_path)
+            #         print("Saved optimizer and scheduler state dictionaries.")
+            #     else:
+            #         torch.save({
+            #             'epoch': (epoch),
+            #             'model_state_dict': model.state_dict(),
+            #             'model_train_dice': train_metrics_agg[0],
+            #             'model_train_hd': train_metrics_agg[2],
+            #             'model_val_dice': val_metrics_agg[0],
+            #             'model_val_hd': val_metrics_agg[2],
+            #             'experiment_name': unique_experiment_name,
+            #             'experiment_key': experiment.get_key()
+            #             }, save_path)
+            #         print(f"Interval model saved! - train_dice: {train_metrics_agg[0]:.4f}, val_dice: {val_metrics_agg[0]:.4f}, best_val_dice: {best_dice_val_score:.4f}.")
         
         #Final epoch report
-        epoch_time=time.time() - start_time_epoch
+        # epoch_time=time.time() - start_time_epoch
         # print(f"Epoch: {epoch+1} finished. Total training loss: {train_loss_agg[0]:.4f} - total epoch time: {epoch_time:.2f}s.")
     
     print(f"Experiment finished! logging to comet server...")

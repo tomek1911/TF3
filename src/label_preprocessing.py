@@ -160,13 +160,6 @@ def remap_labels_fast(data):
     # Create pulp mask in one shot
     pulp_mask = np.isin(data, pulp_ids).astype(np.uint8)
     
-    # # Bridge pulp fragments per tooth
-    # pulp_mask = bridge_pulp_graph(
-    #     pulp_mask=pulp_mask,
-    #     primary=primary,
-    #     max_gap=3
-    # )
-        
     return primary, pulp_mask
 
 # ---- PROCESS ALL FILES ----
