@@ -15,7 +15,6 @@ if general_config['general']['config_source'] == 'cmd':
     
     parser.add_argument('--cuda_device_id', default=1, type=int, choices=[0,1])
     parser.add_argument('--seg_loss_name', default='GWD', type=str, choices=['DiceCELoss', 'DiceFocalLoss', 'GDL', 'GWD'])
-    parser.add_argument('--classification_loss', default='cross_entropy', type=str, choices=['cross_entropy', 'focal_loss'])
     parser.add_argument('--is_weighted_cls', default=True, action='store_true')
     parser.add_argument('--weighting_mode', default='default', type=str, choices=['default', 'GDL'])
     parser.add_argument('--classes', default=33, type=int, choices=[9, 17, 33])
@@ -84,6 +83,45 @@ from src.transforms import Transforms
 from src.logger import DummyExperiment
 from src.deep_watershed import deep_watershed_with_voting
 from src.inference_utils import save_float_map, save_inference_multiclass_segmentation
+from src.metrics_helper import MetricsHelper    
+from src.log_helper import LogHelper
+
+def gpu_transform(train_data, trans, use_thread_loader=False):
+    """
+    GPU processing - applies GPU heavy transforms per sample.
+
+    Parameters
+    ----------
+    train_data : tuple or dict
+        Either a tuple where the first element contains the batch data, 
+        or a dictionary with tensor batches.
+    trans : object
+        Transformation object with a `gpu_transform` method.
+    use_thread_loader : bool, optional
+        If True, bypasses this function and returns the original `train_data`.
+
+    Returns
+    -------
+    torch.Tensor or dict
+        Collated batch data after GPU transforms have been applied.
+    """
+    if use_thread_loader:
+        return train_data
+
+    batch_list = []
+    # If tuple, unpack first element
+    if isinstance(train_data, tuple):
+        train_data = train_data[0]
+
+    batch_size = train_data["image"].shape[0]
+
+    for i in range(batch_size):
+        sample = {k: v[i] for k, v in train_data.items()}
+        sample = trans.gpu_transform(sample)  # apply GPU transforms per sample
+        batch_list.append(sample)
+
+    return default_collate(batch_list)
+
 
 def collate_meta_tensor_with_crop(batch, transforms):
     processed_batch = []
@@ -357,7 +395,6 @@ def main():
                                   collate_fn=partial(collate_meta_tensor_with_crop, transforms=trans.pre_collate_transform)) #collate after random crop - to enable batches
         val_loader = DataLoader(val_dataset, num_workers=args.num_workers, batch_size=args.batch_size_val, sampler=val_sampler, pin_memory=args.pin_memory)
     
-    #setup model, optimizer, scheduler, losses, metrics
     #MODEL
     #num classes = 10 anatomical classes + 32 tooth classes + 3 canal classes + 1 pulp
     model = DWNet(spatial_dims=3, in_channels=1, out_channels=args.out_channels, act=args.activation, norm=args.norm,
@@ -367,18 +404,16 @@ def main():
         model = model.to(device)
     else:
         model = model.to(device)
+    
     #LOSSES
+    weights = None
     if args.weighting_mode != 'none':
         #TODO implement weights calculation, maybe json file?
         if args.weighting_mode == 'inverse_frequency_class_weights':
             weights = torch.tensor(class_labels['weights'], dtype=torch.float32, device=device)
         else:
             raise NotImplementedError(f"Weighting mode {args.weighting_mode} not implemented.")
-    else:
-        # no weights
-        weights = None
         
-    weights = None
     if args.seg_loss_name=="DiceCELoss":
         criterion_seg = DiceCELoss(include_background=args.include_background_loss, ce_weight=weights, to_onehot_y=True, softmax=True)
     elif args.seg_loss_name=="FocalDice":
@@ -386,10 +421,10 @@ def main():
 
     criterion_distance = MSELoss()
     criterion_direction = AngularLoss()
-    criterion_pulp = FocalDiceBCELoss(alpha=0.5, gamma=1.5, bce_weight=5)
+    criterion_pulp = FocalDiceBCELoss(alpha=args.focal_alpha, gamma=args.focal_gamma, bce_weight=args.bce_weight)
         
-    losses = {"multiclass_seg": criterion_seg,
-              "dist_mse": criterion_distance,
+    losses = {"multiclass_seg_loss": criterion_seg,
+              "dist_mse_loss": criterion_distance,
               "dir_loss": criterion_direction,
               "pulp_loss": criterion_pulp
               }
@@ -427,65 +462,67 @@ def main():
         print(f'Loaded model, optimizer and scheduler - continue training from epoch: {args.start_epoch}')
 
     #METRICS
-    reduction='mean_batch'
-    seg_metrics = [
-        DiceMetric(include_background=args.include_background_metrics, reduction=reduction),
-        SurfaceDistanceMetric(include_background=args.include_background_metrics, distance_metric='euclidean', reduction=reduction),
-        HausdorffDistanceMetric(include_background=args.include_background_metrics, distance_metric='euclidean',
-                                percentile=None, get_not_nans=False, directed=False, reduction=reduction),
-    ]
-    seg_metrics_multiclass = [
-        DiceMetric(include_background=args.include_background_metrics, reduction=reduction, ignore_empty=True),
-        SurfaceDistanceMetric(include_background=args.include_background_metrics, distance_metric='euclidean', reduction=reduction),
-        HausdorffDistanceMetric(include_background=args.include_background_metrics, distance_metric='euclidean',
-                                percentile=None, get_not_nans=False, directed=False, reduction=reduction),
-    ]
-    seg_metrics_binary = [
-        DiceMetric(include_background=args.include_background_metrics, reduction='none'),
-        HausdorffDistanceMetric(include_background=args.include_background_metrics, distance_metric='euclidean',
-                                get_not_nans=False, directed=False, reduction='none')
-    ]
-    
-    edt_reg_metrics=[MSEMetric(reduction=reduction)] 
+    metrics_helper = MetricsHelper(args)
+    log_helper = LogHelper(experiment, args)
 
-    #train loss
-    train_loss_cum = CumulativeAverage()
-    edt_loss_cum = CumulativeAverage()
-    seed_loss_cum = CumulativeAverage()
-    seg_loss_cum = CumulativeAverage()
-    seg_mlt_loss_cum = CumulativeAverage()
-    angle_loss_cum = CumulativeAverage()
-    training_loss_cms = [train_loss_cum, edt_loss_cum, seed_loss_cum, seg_loss_cum, seg_mlt_loss_cum, angle_loss_cum]
+    # seg_metrics = [
+    #     DiceMetric(include_background=args.include_background_metrics, reduction=reduction),
+    #     SurfaceDistanceMetric(include_background=args.include_background_metrics, distance_metric='euclidean', reduction=reduction),
+    #     HausdorffDistanceMetric(include_background=args.include_background_metrics, distance_metric='euclidean',
+    #                             percentile=None, get_not_nans=False, directed=False, reduction=reduction),
+    # ]
+    # seg_metrics_multiclass = [
+    #     DiceMetric(include_background=args.include_background_metrics, reduction=reduction, ignore_empty=True),
+    #     SurfaceDistanceMetric(include_background=args.include_background_metrics, distance_metric='euclidean', reduction=reduction),
+    #     HausdorffDistanceMetric(include_background=args.include_background_metrics, distance_metric='euclidean',
+    #                             percentile=None, get_not_nans=False, directed=False, reduction=reduction),
+    # ]
+    # seg_metrics_binary = [
+    #     DiceMetric(include_background=args.include_background_metrics, reduction='none'),
+    #     HausdorffDistanceMetric(include_background=args.include_background_metrics, distance_metric='euclidean',
+    #                             get_not_nans=False, directed=False, reduction='none')
+    # ]
     
-    #train metrics
-    #binary
-    train_dice_cum = CumulativeAverage()
-    train_assd_cum = CumulativeAverage()
-    train_hd_cum = CumulativeAverage()
-    train_mse_edt_cum = CumulativeAverage()
-    #multiclass
-    train_dice_multiclass_cum = CumulativeAverage()
-    train_assd_multiclass_cum = CumulativeAverage()
-    train_hd_multiclass_cum = CumulativeAverage()
-    training_metrics_cms = [train_dice_cum, train_assd_cum, train_hd_cum, train_mse_edt_cum]
-    training_metrics_mlt_cms = [train_dice_multiclass_cum, train_assd_multiclass_cum, train_hd_multiclass_cum]
-    #val metrics
-    #binary
-    val_dice_cum = CumulativeAverage()
-    val_assd_cum = CumulativeAverage()
-    val_hd_cum = CumulativeAverage()
-    train_assd_cum = CumulativeAverage()
-    val_mse_edt_cum = CumulativeAverage()
-    #multiclass
-    val_dice_multiclass_cum = CumulativeAverage()
-    val_assd_multiclass_cum = CumulativeAverage()
-    val_hd_multiclass_cum = CumulativeAverage()
-    val_metrics_cms = [val_dice_cum, val_assd_cum, val_hd_cum, val_mse_edt_cum]
-    val_metrics_mlt_cms = [val_dice_multiclass_cum, val_assd_multiclass_cum, val_hd_multiclass_cum]
+    # edt_reg_metrics=[MSEMetric(reduction=reduction)] 
+
+    # #train loss
+    # train_loss_cum = CumulativeAverage()
+    # edt_loss_cum = CumulativeAverage()
+    # seed_loss_cum = CumulativeAverage()
+    # seg_loss_cum = CumulativeAverage()
+    # seg_mlt_loss_cum = CumulativeAverage()
+    # angle_loss_cum = CumulativeAverage()
+    # training_loss_cms = [train_loss_cum, edt_loss_cum, seed_loss_cum, seg_loss_cum, seg_mlt_loss_cum, angle_loss_cum]
+    
+    # #train metrics
+    # #binary
+    # train_dice_cum = CumulativeAverage()
+    # train_assd_cum = CumulativeAverage()
+    # train_hd_cum = CumulativeAverage()
+    # train_mse_edt_cum = CumulativeAverage()
+    # #multiclass
+    # train_dice_multiclass_cum = CumulativeAverage()
+    # train_assd_multiclass_cum = CumulativeAverage()
+    # train_hd_multiclass_cum = CumulativeAverage()
+    # training_metrics_cms = [train_dice_cum, train_assd_cum, train_hd_cum, train_mse_edt_cum]
+    # training_metrics_mlt_cms = [train_dice_multiclass_cum, train_assd_multiclass_cum, train_hd_multiclass_cum]
+    # #val metrics
+    # #binary
+    # val_dice_cum = CumulativeAverage()
+    # val_assd_cum = CumulativeAverage()
+    # val_hd_cum = CumulativeAverage()
+    # train_assd_cum = CumulativeAverage()
+    # val_mse_edt_cum = CumulativeAverage()
+    # #multiclass
+    # val_dice_multiclass_cum = CumulativeAverage()
+    # val_assd_multiclass_cum = CumulativeAverage()
+    # val_hd_multiclass_cum = CumulativeAverage()
+    # val_metrics_cms = [val_dice_cum, val_assd_cum, val_hd_cum, val_mse_edt_cum]
+    # val_metrics_mlt_cms = [val_dice_multiclass_cum, val_assd_multiclass_cum, val_hd_multiclass_cum]
         
-    best_dice_score = 0.0
-    best_dice_val_score = 0.0
-    best_dice_multiclass_val_score = 0.0
+    # best_dice_score = 0.0
+    # best_dice_val_score = 0.0
+    # best_dice_multiclass_val_score = 0.0
     
     #Setup print
     disable_tqdm = not sys.stderr.isatty()
@@ -500,41 +537,30 @@ def main():
         
     for epoch in tqdm(range(args.start_epoch, args.epochs), desc="Epochs", file=sys.stderr,
                       position=0, leave=True, disable=disable_tqdm):
+        
+        ######################################################################################################
+        ## TRAINING STEP
         print(f"Starting epoch {epoch + 1}")
         model.train()
-        #TRAINING LOOP
+        metrics_helper.reset(phase="train")
         start_time_epoch = time.time()
         pbar = tqdm(enumerate(train_loader), desc=f"Training (epoch {epoch+1})", total=len(train_loader),
                     file=sys.stderr, position=1, leave=False, disable=disable_tqdm)
         with use_tqdm_print(args.use_tqdm_print):
             for batch_idx, train_data in pbar:
-                #Separate cpu and gpu
-                if not args.use_thread_loader:
-                    batch_list = []
-                    train_data = train_data[0]
-                    batch_size = train_data["image"].shape[0]
-                    for i in range(batch_size):
-                        sample = {k: v[i] for k, v in train_data.items()}
-                        sample = trans.gpu_transform(sample)  # apply GPU transforms per sample
-                        batch_list.append(sample)
-                    train_data = default_collate(batch_list)
+                train_data = gpu_transform(train_data, trans, args.use_thread_loader)
                 training_step(args, losses, batch_idx, epoch, model, optimizer, scaler, train_data, train_loader, 
-                            logger, experiment, autocast_d_type, device, pbar)
-        # update scheduler at the end of the training epoch
+                              autocast_d_type, device, pbar, metrics_helper)
+        train_results = metrics_helper.compute(epoch, phase="train")
+        log_helper.log_metrics(epoch, train_results, phase="train")
         scheduler.step()
         epoch_time=time.time() - start_time_epoch
         print(f" Train loop finished - total time: {epoch_time:.2f}s.")
-
-        #RESET METRICS after training step
-        # if args.classes > 1:
-        #     _ = [func.reset() for func in seg_metrics]
-        #     _ = [func.reset() for func in edt_reg_metrics]
-        #     if (epoch+1) >= args.multiclass_metrics_epoch and (epoch+1) % args.multiclass_metrics_interval == 0:
-        #         _ = [func.reset() for func in seg_metrics_multiclass]
-        # else:
-        #     _ = [func.reset() for func in seg_metrics_binary]
-
-        #VALIDATION
+        ######################################################################################################
+        
+        
+        ######################################################################################################
+        ## VALIDATION STEP
 
         if (epoch+1) % args.validation_interval == 0 and epoch != 0 and args.run_validation:
             
@@ -543,10 +569,14 @@ def main():
             pbar = tqdm(enumerate(val_loader), desc=f"Validation epoch {epoch+1})", total=len(val_loader),
                     file=sys.stderr, position=1, leave=False, disable=disable_tqdm)
             model.eval()
+            metrics_helper.reset(phase="val")
             with use_tqdm_print(args.use_tqdm_print):
                 for batch_idx, val_data in pbar:
                     with torch.no_grad():
-                        inference_step(args, batch_idx, epoch, model, scaler, val_data, val_loader, experiment, val_autocast_d_type, device, pbar, trans)
+                        inference_step(args, batch_idx, epoch, model, scaler, val_data, val_loader,
+                                       val_autocast_d_type, device, pbar, trans, metrics_helper)
+            val_results = metrics_helper.compute(epoch, phase="val")
+            log_helper.log_metrics(epoch, val_results, phase="val")
             val_time=time.time() - start_time_validation
             print( f"Validation time: {val_time:.2f}s")
                     
@@ -615,6 +645,10 @@ def main():
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+                    "current_train_metrics": metrics_helper.get_current("train"),
+                    "current_val_metrics": metrics_helper.get_current("val"),
+                    "best_train_metrics": metrics_helper.get_best("train"),
+                    "best_val_metrics": metrics_helper.get_best("val"),
                     'experiment_name': unique_experiment_name,
                 }, ckpt_path)
                 print(f"Checkpoint saved.")

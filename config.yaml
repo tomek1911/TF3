@@ -17,18 +17,24 @@ args:
   perform_test: False
   debug_data_limit: -1 #samples per datacenter: P, F, S, '-1' - no limit, use all data
   tags: null
-  use_tqdm_print: True
-  is_log_qualitative_2d: True
-  is_log_qualitative_3d: False
   run_validation : True
   validation_interval: 20
-  log_batch_interval: 10
-  log_metrics_interval: 10
-  log_slice_interval: 10
-  log_3d_scene_interval_training: 100
-  log_3d_scene_interval_validation: 100
-  multiclass_metrics_interval: 100
-  multiclass_metrics_epoch: 100
+
+# --------------------------------------------------
+# Logger and metrics calculation settings
+# --------------------------------------------------
+  logger_config:
+    use_tqdm_print: True
+    is_log_qualitative_2d: True
+    is_log_qualitative_3d: False
+    log_batch_interval: 10
+    log_metrics_interval: 10
+    log_slice_2d_interval: 10
+    log_3d_scene_training_interval: 25
+    binary_metrics_interval: 25
+    distance_metrics_interval: 10
+    multiclass_metrics_interval: 25
+    multiclass_metrics_firstTime_log: 50
 
 # --------------------------------------------------
 # Device & Parallelism
@@ -57,7 +63,7 @@ args:
   sampler_type: sequential #weighted, random, sequential
   use_thread_loader: False
   num_workers_cache: 16
-  num_workers: 4
+  num_workers: 8
   use_persistent_dataset: True
   generate_watershed_maps: False
 
@@ -144,16 +150,19 @@ args:
 # --------------------------------------------------
 # Loss & Metrics
 # --------------------------------------------------
-  seg_loss_name: DiceCELoss
-  classification_loss: cross_entropy #Options: cross_entropy, focal_loss, sice_loss
-  correctnes_term: False
+  seg_loss_name: DiceCELoss #Options 
   focal_gamma: 0.5
+  focal_alpha: 0.5
+  bce_weight: 5
   weighting_mode: none #Options: none, inverse_frequency_class_weights
   include_background_loss: True
   include_background_metrics: False
-  include_background_gwd: True
-  background_weight: 0.1
-  background_penalty: 2.0
+  reduction: mean_batch
+  loss_names:
+    - multiclass_seg_loss
+    - dist_loss
+    - dir_loss
+    - pulp_loss
 
 # --------------------------------------------------
 # Checkpointing & Resume
