@@ -12,29 +12,28 @@ general:
 # Experiment & Logging Settings
 # --------------------------------------------------
 args:
-  comet: False
+  comet: True
   print_config: False
   perform_test: False
   debug_data_limit: -1 #samples per datacenter: P, F, S, '-1' - no limit, use all data
   tags: null
-  run_validation : True
-  validation_interval: 20
+  run_validation : False
+  validation_interval: 25
 
 # --------------------------------------------------
 # Logger and metrics calculation settings
 # --------------------------------------------------
-  logger_config:
-    use_tqdm_print: True
-    is_log_qualitative_2d: True
-    is_log_qualitative_3d: False
-    log_batch_interval: 10
-    log_metrics_interval: 10
-    log_slice_2d_interval: 10
-    log_3d_scene_training_interval: 25
-    binary_metrics_interval: 25
-    distance_metrics_interval: 10
-    multiclass_metrics_interval: 25
-    multiclass_metrics_firstTime_log: 50
+  use_tqdm_print: True
+  is_log_qualitative_2d: True
+  is_log_qualitative_3d: False
+  log_slice_2d_interval: 10
+  log_3d_scene_training_interval: 25
+  binary_metrics_interval: 25
+  distance_metrics_interval: 25
+  multiclass_metrics_interval: 25
+  multiclass_metrics_firstTime_log: 50
+  is_multiclass_one_hot: False
+  metrics_device: cuda:1
 
 # --------------------------------------------------
 # Device & Parallelism
@@ -66,7 +65,6 @@ args:
   num_workers: 8
   use_persistent_dataset: True
   generate_watershed_maps: False
-
   watershed_maps_source_labels: data/labelsRemapped # Option: data/labelsTr
   keys: 
     - image
@@ -132,11 +130,11 @@ args:
   use_scaler: False
   autocast_dtype: float32
   inference_autocast_dtype: float16
-  lsw: #loss_weights
-    seg_mlt: 1.0
-    dist: 10
-    direction: 1.0e-6
-    pulp: 1.0
+  loss_weights: #loss_weights
+    multiclass_seg_loss: 0.1
+    dist_loss: 10
+    dir_loss: 1.0e-6
+    pulp_loss: 0.1
 
 # --------------------------------------------------
 # Scheduler Settings
@@ -151,13 +149,13 @@ args:
 # Loss & Metrics
 # --------------------------------------------------
   seg_loss_name: DiceCELoss #Options 
-  focal_gamma: 0.5
+  focal_gamma: 0.2
   focal_alpha: 0.5
   bce_weight: 5
   weighting_mode: none #Options: none, inverse_frequency_class_weights
   include_background_loss: True
   include_background_metrics: False
-  reduction: mean_batch
+  reduction: mean
   loss_names:
     - multiclass_seg_loss
     - dist_loss
@@ -169,10 +167,10 @@ args:
 # --------------------------------------------------
   save_checkpoints: True
   checkpoint_dir: checkpoints
-  save_interval: 5
-  save_optimiser_interval: 200
+  save_interval: 25
+  save_optimiser_interval: 25
   save_optimizer: True           
-  start_epoch: 0
+  start_epoch: 1
   trained_model: null
   continue_training: False
 

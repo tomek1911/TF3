@@ -366,3 +366,28 @@ class FocalDiceBCELoss(nn.Module):
         dice_loss, focal_loss  = self.focal_dice(logits, target)
         focal_dice_loss = 0.1 * focal_loss + 0.9 * dice_loss
         return self.alpha * bce + (1 - self.alpha) * focal_dice_loss
+    
+class DiceBCELoss(nn.Module):
+    """
+    Combined loss for 1-channel segmentation: BCE + Dice.
+    
+    Args:
+        alpha (float): weight for BCE loss. Dice weight = 1 - alpha
+        bce_weight (float, optional): weight for positive class in BCE (default=1.0)
+        smooth (float, optional): smoothing factor for Dice calculation
+    """
+    def __init__(self, alpha=0.5, bce_weight=1.0):
+        super().__init__()
+        self.alpha = alpha
+        self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(bce_weight))
+        self.dice_loss = DiceLoss(sigmoid=True) 
+
+    def forward(self, logits, target):
+        """
+        Args:
+            logits: raw network output, shape (B, 1, D, H, W)
+            target: ground truth, shape (B, 1, D, H, W)
+        """
+        bce = self.bce_loss(logits, target.float())
+        dice_loss = self.dice_loss(logits, target)
+        return self.alpha * bce + (1 - self.alpha) * dice_loss

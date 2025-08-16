@@ -1,6 +1,9 @@
 import os
 import torch
 import numpy as np
+import nibabel as nib
+from monai.data import MetaTensor, decollate_batch
+from monai.transforms import Orientationd
 from monai.transforms import SaveImage
 
 original_to_index_map = {
@@ -12,6 +15,28 @@ original_to_index_map = {
     103: 43, 104: 44, 105: 45,
 }
 
+def save_nifti(array, path, filename, pixdim = 0.4, label_meta_dict=None, affine=None, dtype = np.int16):
+    if label_meta_dict is None:
+        affine = np.eye(4) * pixdim
+        affine[3][3]=1.0
+    else:
+        if len(array.shape)==5:
+            label_meta_dict = decollate_batch(label_meta_dict)[0]
+            array = array[0]
+        affine = label_meta_dict["affine"].numpy()
+        space = label_meta_dict['space']
+        if nib.aff2axcodes(affine) == ('L', 'P', 'S') and space == "RAS":
+            t = MetaTensor(array, meta=label_meta_dict)
+            array=Orientationd(keys="label", axcodes="RAS")({"label": t})["label"]
+    if torch.is_tensor(array):
+        nib_array = nib.Nifti1Image(array.cpu().squeeze().numpy().astype(dtype), affine=affine)
+    else:
+        nib_array = nib.Nifti1Image(array.astype(dtype), affine=affine)
+    if not os.path.exists(path):
+        os.makedirs(path)
+    save_path = os.path.join(path, filename)
+    nib.save(nib_array, save_path)
+
 def save_inference_multiclass_segmentation(
     output_dir: str,
     array: np.ndarray,
@@ -19,7 +44,7 @@ def save_inference_multiclass_segmentation(
     invert_transform,
     original_image,
     name: str,
-    is_invert_mapping: bool = True,
+    is_invert_mapping: bool = False,
     label_map: dict = None,
     dtype=np.float32
 ):

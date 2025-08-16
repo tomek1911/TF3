@@ -10,6 +10,8 @@ from monai.transforms import (
 )
 
 from monai.transforms import (
+    ActivationsD,
+    AsDiscreteD,
     CopyItemsD,
     EnsureChannelFirstD,
     EnsureTypeD,
@@ -28,6 +30,7 @@ from monai.transforms import (
     RandSpatialCropSamplesD,
     RandZoomD,
     ResizeWithPadOrCropD,
+    SaveImageD,
     ScaleIntensityRangeD,
     SpacingD,
     SpatialPadD,
@@ -126,7 +129,7 @@ class Transforms():
             SpacingD(keys=self.keys, pixdim=self.pixdim, mode=self.mode),
             ScaleIntensityRangeD(keys="image", a_min=0, a_max=args.houndsfield_clip, b_min=0.0, b_max=1.0, clip=True),
             SpatialPadD(keys=self.keys, spatial_size=args.patch_size, mode="constant", constant_values=0),
-            LambdaD(keys=["label"], func=partial(remap_labels, mapping=original_to_index_map, channel_id=0))
+            LambdaD(keys="label", func=partial(remap_labels, mapping=original_to_index_map, channel_id=0))
             ]
         
         self.pre_collate = [
@@ -147,7 +150,7 @@ class Transforms():
 
         self.final_transform = [
             LambdaD(keys=["image", "watershed_map"], func=to_float),
-            LambdaD(keys=["label"], func=to_long)
+            LambdaD(keys="label", func=to_long)
         ]
         if not args.use_augmentations:
             self.geometric_transforms = []
@@ -171,7 +174,7 @@ class Transforms():
             InvertD(
                 keys="pred",
                 transform=self.inference_transform,
-                orig_keys=["image"],
+                orig_keys="image",
                 to_tensor=True,
             )
         ])
@@ -186,6 +189,23 @@ class Transforms():
                                                        dim=0,
                                                        keepdim=True)
                                             ])
+        self.post_transform_binary = Compose(
+                        [
+                            ActivationsD(keys="pred", sigmoid=True),
+                            InvertD(
+                                keys="pred",  # invert the `pred` data field, also support multiple fields
+                                transform= self.inference_transform,
+                                orig_keys="image",  # get the previously applied pre_transforms information on the `img` data field,
+                                # then invert `pred` based on this information. we can use same info
+                                # for multiple fields, also support different orig_keys for different fields
+                                nearest_interp=False,  # don't change the interpolation mode to "nearest" when inverting transforms
+                                # to ensure a smooth output, then execute `AsDiscreted` transform
+                                to_tensor=True,  # convert to PyTorch Tensor after inverting
+                            ),
+                            AsDiscreteD(keys="pred", threshold=0.5),
+                            SaveImageD(keys="pred", output_dir="output", output_postfix="seg", resample=False, separate_folder=False),
+                        ]
+                    )
         
 
 if __name__ == "__main__":

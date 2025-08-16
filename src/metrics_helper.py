@@ -1,9 +1,10 @@
 import torch
+import warnings
 import numpy as np
 from collections import defaultdict
 from monai.metrics import MSEMetric
 from monai.metrics import HausdorffDistanceMetric, SurfaceDistanceMetric, DiceMetric
-
+from monai.networks.utils import one_hot
 
 class MetricsHelper:
     def __init__(self, args):
@@ -11,25 +12,23 @@ class MetricsHelper:
         args: config with attributes like include_background_metrics, metric_intervals, etc.
         """
         self.args = args
-        self.logger_config = args.logger_config
 
         self.metrics_segmentation_binary = [
-            DiceMetric(include_background=args.include_background_metrics, reduction=args.reduction),
-            SurfaceDistanceMetric(include_background=args.include_background_metrics, distance_metric='euclidean', reduction=args.reduction),
-            HausdorffDistanceMetric(include_background=args.include_background_metrics, distance_metric='euclidean',
-                                    percentile=None, get_not_nans=False, directed=False, reduction=args.reduction)
+            DiceMetric(include_background=args.include_background_metrics, reduction=args.reduction, ignore_empty=True),
+            # SurfaceDistanceMetric(include_background=args.include_background_metrics, distance_metric='euclidean', reduction=args.reduction, symmetric=True),
+            # HausdorffDistanceMetric(include_background=args.include_background_metrics, distance_metric='euclidean',
+            #                         percentile=None, get_not_nans=False, directed=False, reduction=args.reduction)
         ]
         self.metrics_segmentation_multiclass = [
             DiceMetric(include_background=args.include_background_metrics, reduction=args.reduction, ignore_empty=True),
-            SurfaceDistanceMetric(include_background=args.include_background_metrics, distance_metric='euclidean', reduction=args.reduction),
-            HausdorffDistanceMetric(include_background=args.include_background_metrics, distance_metric='euclidean',
-                                    percentile=None, get_not_nans=False, directed=False, reduction=args.reduction),
+            # SurfaceDistanceMetric(include_background=args.include_background_metrics, distance_metric='euclidean', reduction=args.reduction, symmetric=True),
+            # HausdorffDistanceMetric(include_background=args.include_background_metrics, distance_metric='euclidean',
+            #                         percentile=None, get_not_nans=False, directed=False, reduction=args.reduction),
         ]
         self.distance_metrics = [MSEMetric(reduction=args.reduction)]
-        
         self.results = {"train": {}, "val": {}}
-
         self.metric_higher_is_better = {}
+        self.device_metrics = torch.device(args.metrics_device)  
 
         for m in self.metrics_segmentation_binary + \
                 self.metrics_segmentation_multiclass + \
@@ -54,21 +53,38 @@ class MetricsHelper:
         """
         Accumulate predictions & labels for metrics that should be computed this epoch.
         """
-        binary_output, multiclass_output, distance_map_output = outputs
-        binary_label, multiclass_label, distance_map_label = labels
-        # Example interval check
-        if epoch % self.logger_config.binary_metrics_interval == 0:
-            for metric in self.metrics_segmentation_binary:
-                metric(y_pred=binary_output, y=binary_label)
+        
+        multiclass_output, binary_output, distance_map_output = (t.detach() for t in outputs)
+        multiclass_label, binary_label, distance_map_label = (t.detach() for t in labels)
 
-        if epoch % self.logger_config.multiclass_metrics_interval == 0 and epoch >= self.logger_config.multiclass_metrics_firstTime_log:
-            for metric in self.metrics_segmentation_multiclass:
-                metric(y_pred=multiclass_output, y=multiclass_label)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="monai.metrics.utils")
+            if epoch % self.args.binary_metrics_interval == 0:
+                y_pred = (torch.sigmoid(binary_output) > 0.5).float().to(self.device_metrics)
+                y = binary_label.to(self.device_metrics)
+                for metric in self.metrics_segmentation_binary:
+                    metric(y_pred, y)
 
-        if epoch % self.logger_config.distance_metrics_interval == 0:
-            for metric in self.distance_metrics:
-                metric(y_pred=distance_map_output, y=distance_map_label)
-                
+            if epoch % self.args.multiclass_metrics_interval == 0:
+                if epoch >= self.args.multiclass_metrics_firstTime_log:
+                    y_pred = multiclass_output.argmax(dim=1, keepdim=True).to(self.device_metrics)
+                    y = multiclass_label.to(self.device_metrics)
+                    if self.args.is_multiclass_one_hot:
+                        y_pred = one_hot(y_pred, num_classes=self.args.out_channels, dim=1)
+                        y = one_hot(y, num_classes=self.args.out_channels, dim=1)
+                    for metric in self.metrics_segmentation_multiclass:
+                        metric(y_pred, y)
+                else:
+                    #binary version for early epochs
+                    y_pred=(multiclass_output.argmax(dim=1, keepdim=True) != 0).long().to(self.device_metrics)
+                    y=torch.where(multiclass_label >= 1, 1, 0).to(self.device_metrics)
+                    for metric in self.metrics_segmentation_multiclass:
+                        metric(y_pred,y)
+        
+            if epoch % self.args.distance_metrics_interval == 0:
+                for metric in self.distance_metrics:
+                    metric(y_pred=torch.sigmoid(distance_map_output), y=distance_map_label)
+        
                 
     def compute(self, epoch, phase="train"):
         """
@@ -77,7 +93,7 @@ class MetricsHelper:
         """
         results = {}
 
-        def compute_group(metrics, interval, min_epoch=None):
+        def compute_group(metrics, interval, min_epoch=None, name_postfix=""):
             group_results = {}
             if epoch % interval == 0 and (min_epoch is None or epoch >= min_epoch):
                 for m in metrics:
@@ -87,10 +103,11 @@ class MetricsHelper:
 
                     # If aggregate() returns tensor, convert to scalar
                     val = val.item() if hasattr(val, "item") else val
-                    name = m.__class__.__name__
-                    group_results[name] = val
+                    unique_name = m.__class__.__name__ + '_' + name_postfix
+                    group_results[unique_name] = val
 
                     # Determine if higher is better
+                    name = m.__class__.__name__ #metric type name
                     higher_is_better = self.metric_higher_is_better.get(name, True)  # default True
                     if higher_is_better:
                         if val > self.best_results[phase][name]:
@@ -103,16 +120,15 @@ class MetricsHelper:
 
             return group_results
 
-        results.update(compute_group(self.metrics_segmentation_binary,
-                       self.logger_config.binary_metrics_interval))
-        results.update(compute_group(self.metrics_segmentation_multiclass, self.logger_config.multiclass_metrics_interval,
-                       min_epoch=self.logger_config.multiclass_metrics_firstTime_log))
+        results.update(compute_group(self.metrics_segmentation_binary, self.args.binary_metrics_interval, name_postfix="pulp"))
+        results.update(compute_group(self.metrics_segmentation_multiclass, self.args.multiclass_metrics_interval,
+                       min_epoch=self.args.multiclass_metrics_firstTime_log, name_postfix="multiclass"))
         results.update(compute_group(self.distance_metrics,
-                       self.logger_config.distance_metrics_interval))
+                       self.args.distance_metrics_interval, name_postfix="distance"))
 
         self.results[phase] = results
 
-    def reset(self, phase=None):
+    def reset(self):
         for group in [self.metrics_segmentation_binary, 
                       self.metrics_segmentation_multiclass, 
                       self.distance_metrics]:
@@ -128,16 +144,14 @@ class MetricsHelper:
         return dict(self.results[phase])
     
 if __name__ == "__main__":
-    # Placeholder args
-    class LoggerConfig:
+    class Args:
+        include_background_metrics = False
+        reduction = "mean"
         binary_metrics_interval = 10
         distance_metrics_interval = 5
         multiclass_metrics_interval = 20
         multiclass_metrics_firstTime_log = 40
-    class Args:
-        include_background_metrics = False
-        reduction = "mean"
-        logger_config = LoggerConfig
+
 
     args = Args()
     metrics_helper = MetricsHelper(args)
