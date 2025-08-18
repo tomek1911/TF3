@@ -58,6 +58,14 @@ class LogHelper:
             weighted_total += last_val * weight
         return weighted_total
     
+    def log_lr(self, scheduler, epoch):
+        if self.args.scheduler_name == "warmup_cosine":
+            self.experiment.log_metric("lr_rate", scheduler.get_last_lr(), epoch=epoch)
+        elif self.args.scheduler_name == "warmup_cosine_restarts":
+            self.experiment.log_metric("lr_rate", scheduler.get_lr(), epoch=epoch)
+        else:
+            raise UserWarning(f"Unknown scheduler: {self.args.scheduler_name}, omitting logging.")
+    
     def log_losses(self, epoch, phase="train"):
 
         # Compute weighted total loss
@@ -80,7 +88,7 @@ class LogHelper:
                 epoch,
                 loss_name,
                 f"{avg.aggregate():.6f}",
-                f"{weight:.3f}",
+                f"{weight:.4g}",
                 f"{avg.aggregate() * weight:.6f}"
             ])
         table.add_row([epoch, "Weighted Total", "-", "-", f"{weighted_total:.6f}"])
@@ -108,7 +116,7 @@ class LogHelper:
             ):
                 comet_name = f"{phase}/metric/{name}"
                 self.experiment.log_metric(comet_name, metrics_results[phase][name], step=epoch)
-                table.add_row([epoch, phase, name, f"{metrics_results[phase][name]:.4f}"])
+                table.add_row([epoch, phase, name, f"{metrics_results[phase][name]:.4g}"])
 
         if table._rows:
             print(table)
@@ -136,42 +144,38 @@ if __name__ == "__main__":
         distance_metrics_interval = 1
         multiclass_metrics_interval = 4
         multiclass_metrics_firstTime_log = 4
+        is_multiclass_one_hot = True
+        metrics_device = "cuda:1"
+        out_channels = 5 
         
     args = Args()
     experiment = DummyExperiment()
     metrics_helper = MetricsHelper(args)
     log_helper = LogHelper(experiment, args)
 
-    n_epochs = 10
+    n_epochs = 20
     batches_per_epoch = 20
     batch_size = 2
-    shape = (1, 16, 16, 16)
+    shape = (batch_size, 1, 16, 16, 16)
     
-    # Define metrics groups
-    metrics_segmentation_binary = [DiceMetric(include_background=True, reduction="mean")]
-    metrics_segmentation_multiclass = [DiceMetric(include_background=True, reduction="mean")]
-    distance_metrics = [HausdorffDistanceMetric(include_background=True, reduction="mean")]
-
-
+    # Dummy labels
     binary_label = torch.randint(0, 2, size=shape).float()
-    multiclass_label = torch.randint(0, 3, size=shape).float()
+    multiclass_label = torch.randint(0, args.out_channels, size=shape).float()
     distance_map_label = torch.rand(shape)
     labels = (binary_label, multiclass_label, distance_map_label)
     
 
     for epoch in range(1, n_epochs + 1):
-        metrics_helper.reset(phase="train")
         print(f"\n=== Epoch {epoch} ===")
 
         pbar = tqdm(range(batches_per_epoch), desc=f"Epoch {epoch}")
         for batch_idx in pbar:
-            # Simulate predictions
-            binary_output = torch.randint(0, 2, size=shape).float()
-            multiclass_output = torch.randint(0, 3, size=shape).float()
+            # Dummy outputs
+            binary_output = torch.randn(size=shape).float()
+            multiclass_output = torch.randn(size=(batch_size, args.out_channels, *shape[2:])).float()
             distance_map_output = torch.rand(shape)
             outputs = (binary_output, multiclass_output, distance_map_output)
 
-            # Update metrics
             metrics_helper.update(outputs, labels, epoch)
 
             # Simulate batch losses
@@ -186,6 +190,7 @@ if __name__ == "__main__":
 
         # Compute metrics for this epoch (respects intervals)
         metrics_helper.compute(epoch, phase="train")
-
-        # Log metrics to experiment + print table
+        metrics_helper.reset()
+        
         log_helper.log_metrics(epoch, metrics_helper.results, phase="train")
+        log_helper.log_losses(epoch, phase="train")

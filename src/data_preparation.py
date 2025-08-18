@@ -94,7 +94,7 @@ def create_domain_labels(file_list):
     """
     return [extract_device(os.path.basename(item['image'])) for item in file_list]
 
-def build_sampler(dataset, domain_labels, args):
+def build_sampler(dataset, domain_labels, args, split="train"):
     """
     Create a sampler based on args.sampler choice.
 
@@ -105,14 +105,17 @@ def build_sampler(dataset, domain_labels, args):
 
     """
     sampler_type = args.sampler_type.lower()
-    if sampler_type == 'sequential':
+    if sampler_type == 'sequential' or split == "val":
         return SequentialSampler(dataset)
     elif sampler_type == 'random':
         return RandomSampler(dataset)
-    elif sampler_type == 'weighted':
+    elif sampler_type == 'weighted': #there are 3 data_centers - weight them accordingly because of imbalance
         counts = Counter(domain_labels)
-        weights = [1.0 / counts[label] for label in domain_labels]
-        return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+        weights = [1.0 / counts[label] ** (1/5) for label in domain_labels]
+        weights_array = np.array(weights)
+        weights_array = weights_array / weights_array.mean()
+        print(f"Using weighted sampler with weights: {np.unique(weights_array)}, given dataset center counts: {counts}.")
+        return WeightedRandomSampler(weights_array.tolist(), num_samples=len(weights), replacement=True)
     else:
         raise ValueError(f"Unsupported sampler type: {args.sampler}")
     

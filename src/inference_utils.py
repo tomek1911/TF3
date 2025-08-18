@@ -124,3 +124,32 @@ def save_float_map(
         resample=False  # preserve original geometry
     )
     saver(map_nifti, meta_dict)
+    
+def merge_pulp_into_teeth(multiclass_pred: np.ndarray, pulp_pred: np.ndarray, pulp_class: int = 111, excluded_classes=None) -> np.ndarray:
+    """
+    Merge pulp segmentation into teeth predictions.
+    
+    Args:
+        teeth_pred: 3D array of teeth instance predictions (e.g., from deep watershed)
+        pulp_pred: 3D array of binary pulp segmentation (1 = pulp, 0 = background)
+        pulp_class: integer label to assign to pulp voxels inside teeth (default=111)
+        excluded_classes: list of class labels to exclude from teeth mask
+    
+    Returns:
+        merged_pred: 3D array with pulp merged into teeth, respecting tooth mask
+    """
+    if excluded_classes is None:
+        excluded_classes = list(range(0, 11)) + [43, 44, 45]
+        
+    merged_pred = multiclass_pred.copy()
+    
+    # Mask: valid teeth voxels (not in excluded classes)
+    teeth_mask = ~np.isin(multiclass_pred, excluded_classes)
+    
+    # Only keep pulp inside valid teeth
+    pulp_inside_teeth = (pulp_pred > 0) & teeth_mask
+    
+    # Assign pulp class
+    merged_pred[pulp_inside_teeth] = pulp_class
+    
+    return merged_pred

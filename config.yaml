@@ -12,13 +12,11 @@ general:
 # Experiment & Logging Settings
 # --------------------------------------------------
 args:
-  comet: True
+  comet: comet
   print_config: False
   perform_test: False
   debug_data_limit: -1 #samples per datacenter: P, F, S, '-1' - no limit, use all data
   tags: null
-  run_validation : False
-  validation_interval: 25
 
 # --------------------------------------------------
 # Logger and metrics calculation settings
@@ -27,11 +25,15 @@ args:
   is_log_qualitative_2d: True
   is_log_qualitative_3d: False
   log_slice_2d_interval: 10
-  log_3d_scene_training_interval: 25
-  binary_metrics_interval: 25
-  distance_metrics_interval: 25
-  multiclass_metrics_interval: 25
-  multiclass_metrics_firstTime_log: 50
+  log_3d_scene_training_interval: 20
+
+  run_validation : True
+  validation_interval: 20 # it should be divisible by metrics_interval!
+
+  binary_metrics_interval: 20
+  distance_metrics_interval: 20
+  multiclass_metrics_interval: 20
+  multiclass_metrics_firstTime_log: 40
   is_multiclass_one_hot: False
   metrics_device: cuda:1
 
@@ -55,11 +57,12 @@ args:
   labels_folder: labelsRemapped # Option: labelsTr 
   watershed_maps_folder: deep_watershed_maps/distdir_maps
   cache_dir: data/cache
+  experiment_dir: output/comet_nii_logs
   clear_cache: False
   create_preproc_cache: False
   val_items: 10 # validaiton samples per datacenter - 30 scans
   use_json_split: True
-  sampler_type: sequential #weighted, random, sequential
+  sampler_type: weighted #weighted, random, sequential
   use_thread_loader: False
   num_workers_cache: 16
   num_workers: 8
@@ -90,12 +93,12 @@ args:
   zoom_prob: 0.5
 
   # Intensity Augmentation
-  intensity_scale: 0.15
-  intensity_scale_prob: 0.5
-  intensity_shift: 0.2
-  intensity_shift_prob: 0.5
-  contrast : 0.3
-  intensity_contrast_prob: 0.5
+  intensity_scale: 0.1
+  intensity_scale_prob: 0.75
+  intensity_shift: 0.1
+  intensity_shift_prob: 0.75
+  contrast : 0.2
+  intensity_contrast_prob: 0.75
 
   # Monai & preprocessing
   lazy_interpolation: True
@@ -116,7 +119,7 @@ args:
 # --------------------------------------------------
 # Training Hyperparameters
 # --------------------------------------------------
-  epochs: 100
+  epochs: 400
   batch_size: 2
   batch_size_val: 1
   gradient_accumulation: 1
@@ -143,7 +146,7 @@ args:
   warmup_steps: 0
   first_cycle_steps: 1.0    
   scheduler_gamma: 0.5
-  min_lr: 1.0e-5
+  min_lr: 5.0e-5
 
 # --------------------------------------------------
 # Loss & Metrics
@@ -152,7 +155,7 @@ args:
   focal_gamma: 0.2
   focal_alpha: 0.5
   bce_weight: 5
-  weighting_mode: none #Options: none, inverse_frequency_class_weights
+  weighting_mode: inverse_frequency_class_weights #Options: none, inverse_frequency_class_weights
   include_background_loss: True
   include_background_metrics: False
   reduction: mean
@@ -167,8 +170,8 @@ args:
 # --------------------------------------------------
   save_checkpoints: True
   checkpoint_dir: checkpoints
-  save_interval: 25
-  save_optimiser_interval: 25
+  save_interval: 20
+  save_optimiser_interval: 80
   save_optimizer: True           
   start_epoch: 1
   trained_model: null

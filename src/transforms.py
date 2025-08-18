@@ -45,6 +45,17 @@ original_to_index_map = {
     41: 35, 42: 36, 43: 37, 44: 38, 45: 39, 46: 40, 47: 41, 48: 42,
     103: 43, 104: 44, 105: 45
 }
+class SaveMultipleKeysD:
+    def __init__(self, keys, output_dir, output_postfixes, separate_folder):
+        self.keys = keys
+        self.postfixes = output_postfixes
+        self.output_dir = output_dir
+        self.separate_folder = separate_folder
+        
+    def __call__(self, data):
+        for key, postfix in zip(self.keys, self.postfixes):
+            SaveImageD(keys=[key], output_dir=self.output_dir, output_postfix=postfix, separate_folder=self.separate_folder)(data)
+        return data
 
 def move_to_device(x, device):
     if x.device == device:
@@ -132,6 +143,17 @@ class Transforms():
             LambdaD(keys="label", func=partial(remap_labels, mapping=original_to_index_map, channel_id=0))
             ]
         
+        self.preprocessing_inference_transforms = [
+            LoadImageD(keys="image", reader='NibabelReader'),
+            EnsureChannelFirstD(keys="image"),
+            OrientationD(keys="image", axcodes="RAS"),
+            SpacingD(keys="image", pixdim=self.pixdim, mode="bilinear"),
+            ScaleIntensityRangeD(keys="image", a_min=0, a_max=args.houndsfield_clip, b_min=0.0, b_max=1.0, clip=True),
+            SpatialPadD(keys="image", spatial_size=args.patch_size, mode="constant", constant_values=0),
+            EnsureTypeD(keys="image", dtype=torch.float16),
+            ToDeviceD(keys="image", device=device)
+            ]
+        
         self.pre_collate = [
             RandSpatialCropSamplesD(keys=self.keys, roi_size=args.patch_size, random_size=False, num_samples=args.crop_samples)
         ]
@@ -170,14 +192,6 @@ class Transforms():
         
         self.inference_transform = Compose(self.preprocessing_transforms)
 
-        self.invert_inference_transform = Compose([
-            InvertD(
-                keys="pred",
-                transform=self.inference_transform,
-                orig_keys="image",
-                to_tensor=True,
-            )
-        ])
 
         self.post_pred_train = Compose([Activations(softmax=True, dim=1),
                                         AsDiscrete(argmax=True,
@@ -207,6 +221,30 @@ class Transforms():
                         ]
                     )
         
+        self.inference_preprocessing = Compose(self.preprocessing_inference_transforms)
+        
+        self.post_inference_transform = Compose(
+                [
+                    InvertD(
+                        keys=['mlt','pulp','dist', 'dir'],  # invert the `pred` data field, also support multiple fields
+                        transform= self.inference_preprocessing,
+                        orig_keys="image",  # get the previously applied pre_transforms information on the `img` data field,
+                        # then invert `pred` based on this information. we can use same info
+                        # for multiple fields, also support different orig_keys for different fields
+                        nearest_interp=False,  # don't change the interpolation mode to "nearest" when inverting transforms
+                        # to ensure a smooth output, then execute `AsDiscreted` transform
+                        to_tensor=True,  # convert to PyTorch Tensor after inverting
+                    ),
+                    # AsDiscreteD(keys="pred", threshold=0.5),
+                    # SaveImageD(keys="pred", output_dir="output", output_postfix="seg", resample=False, separate_folder=False),
+                ]
+            )
+        self.save_inference_output = SaveMultipleKeysD(keys=['mlt','pulp','dist'], output_dir="output", output_postfixes=['mlt','pulp','dist'], separate_folder=False)
+        self.save_inference_output_pred = SaveImageD(keys='pred', output_dir="output", output_postfix='pred', separate_folder=False)
+        # self.save_inference_output_mlt = SaveImageD(keys="pred", output_dir="output", output_postfix="mlt", resample=False, separate_folder=False)
+        # self.save_inference_output_pulp = SaveImageD(keys="pred", output_dir="output", output_postfix="pulp", resample=False, separate_folder=False)
+        # self.save_inference_output_dist = SaveImageD(keys="pred", output_dir="output", output_postfix="dist", resample=False, separate_folder=False)
+                
 
 if __name__ == "__main__":
     import torch

@@ -1,18 +1,21 @@
 import torch
 import warnings
 import numpy as np
+import cupy as cp
 from collections import defaultdict
 from monai.metrics import MSEMetric
 from monai.metrics import HausdorffDistanceMetric, SurfaceDistanceMetric, DiceMetric
 from monai.networks.utils import one_hot
 
 class MetricsHelper:
-    def __init__(self, args):
+    def __init__(self, args, group_names = ["binary", "multiclass", "distance"]):
         """
         args: config with attributes like include_background_metrics, metric_intervals, etc.
         """
         self.args = args
-
+        
+        # Metric groups
+        self.metrics_group_names = group_names
         self.metrics_segmentation_binary = [
             DiceMetric(include_background=args.include_background_metrics, reduction=args.reduction, ignore_empty=True),
             # SurfaceDistanceMetric(include_background=args.include_background_metrics, distance_metric='euclidean', reduction=args.reduction, symmetric=True),
@@ -26,66 +29,92 @@ class MetricsHelper:
             #                         percentile=None, get_not_nans=False, directed=False, reduction=args.reduction),
         ]
         self.distance_metrics = [MSEMetric(reduction=args.reduction)]
+        
+        # Results and best tracking
         self.results = {"train": {}, "val": {}}
         self.metric_higher_is_better = {}
         self.device_metrics = torch.device(args.metrics_device)  
 
-        for m in self.metrics_segmentation_binary + \
-                self.metrics_segmentation_multiclass + \
-                self.distance_metrics:
-            if isinstance(m, DiceMetric):
-                self.metric_higher_is_better[m.__class__.__name__] = True
-            else:
-                # Hausdorff, SurfaceDistance, MSE, etc
-                self.metric_higher_is_better[m.__class__.__name__] = False
-
-        # Initialize best_results based on this
+        # Initialize metric values with unique keys
+        for group_name, metrics in [
+            (self.metrics_group_names[0], self.metrics_segmentation_binary),
+            (self.metrics_group_names[1], self.metrics_segmentation_multiclass),
+            (self.metrics_group_names[2], self.distance_metrics),
+        ]:
+            for m in metrics:
+                key = self._metric_key(m, group_name)
+                if isinstance(m, DiceMetric):
+                    self.metric_higher_is_better[key] = True
+                else:
+                    self.metric_higher_is_better[key] = False
+                    
+                    
+        # Initialize best_results
         self.best_results = {"train": {}, "val": {}}
         for phase in ["train", "val"]:
             for name, higher in self.metric_higher_is_better.items():
-                if higher:
-                    self.best_results[phase][name] = -np.inf
-                else:
-                    self.best_results[phase][name] = np.inf
-                    
+                self.best_results[phase][name] = -np.inf if higher else np.inf
+    
+    def _metric_key(self, metric, group_name, idx=None):
+        """Generate unique key for a metric instance."""
+        key = f"{group_name}_{metric.__class__.__name__}"
+        if idx is not None:
+            key += f"_{idx}"
+        return key
 
     def update(self, outputs, labels, epoch):
         """
         Accumulate predictions & labels for metrics that should be computed this epoch.
         """
         
-        multiclass_output, binary_output, distance_map_output = (t.detach() for t in outputs)
-        multiclass_label, binary_label, distance_map_label = (t.detach() for t in labels)
+        binary_output, multiclass_output, distance_map_output = outputs
+        binary_label, multiclass_label, distance_map_label = labels
 
-        with warnings.catch_warnings():
+        with torch.inference_mode(), warnings.catch_warnings(), cp.cuda.Device(int(self.args.metrics_device[-1])):
             warnings.filterwarnings("ignore", category=UserWarning, module="monai.metrics.utils")
             if epoch % self.args.binary_metrics_interval == 0:
-                y_pred = (torch.sigmoid(binary_output) > 0.5).float().to(self.device_metrics)
-                y = binary_label.to(self.device_metrics)
+                b_out = binary_output.detach().to(self.device_metrics, non_blocking=True)
+                b_lab = binary_label.detach().to(self.device_metrics, non_blocking=True)
+                y_pred = (torch.sigmoid(b_out) > 0.5).float().to(self.device_metrics)
+                y = b_lab.to(self.device_metrics)
                 for metric in self.metrics_segmentation_binary:
                     metric(y_pred, y)
+                del b_out, b_lab, y_pred, y
 
             if epoch % self.args.multiclass_metrics_interval == 0:
+                mc_out = multiclass_output.detach().to(self.device_metrics, non_blocking=True)
+                mc_lab = multiclass_label.detach().to(self.device_metrics, non_blocking=True)
                 if epoch >= self.args.multiclass_metrics_firstTime_log:
-                    y_pred = multiclass_output.argmax(dim=1, keepdim=True).to(self.device_metrics)
-                    y = multiclass_label.to(self.device_metrics)
-                    if self.args.is_multiclass_one_hot:
+                    y_pred = mc_out.argmax(dim=1, keepdim=True).to(self.device_metrics)
+                    y = mc_lab.to(self.device_metrics)
+                    if self.args.is_multiclass_one_hot: # required for surface distance and hausdorff metrics
                         y_pred = one_hot(y_pred, num_classes=self.args.out_channels, dim=1)
                         y = one_hot(y, num_classes=self.args.out_channels, dim=1)
-                    for metric in self.metrics_segmentation_multiclass:
-                        metric(y_pred, y)
+                        for metric in self.metrics_segmentation_multiclass:
+                            metric(y_pred, y)
+                    else:
+                        for metric in self.metrics_segmentation_multiclass[:1]: #only dice metric - IGNORE, others require one-hot
+                            metric(y_pred, y)
+                    del y_pred, y
                 else:
                     #binary version for early epochs
-                    y_pred=(multiclass_output.argmax(dim=1, keepdim=True) != 0).long().to(self.device_metrics)
-                    y=torch.where(multiclass_label >= 1, 1, 0).to(self.device_metrics)
-                    for metric in self.metrics_segmentation_multiclass:
+                    y_pred=(mc_out.argmax(dim=1, keepdim=True) != 0).long().to(self.device_metrics)
+                    ones = torch.ones_like(mc_lab, device=self.device_metrics)
+                    zeros = torch.zeros_like(mc_lab, device=self.device_metrics)
+                    y = torch.where(mc_lab >= 1, ones, zeros).to(torch.long)
+                    for metric in self.metrics_segmentation_multiclass: 
                         metric(y_pred,y)
+                    del y_pred, y, ones, zeros
+                del mc_out, mc_lab
         
             if epoch % self.args.distance_metrics_interval == 0:
+                d_out = distance_map_output.detach().to(self.device_metrics, non_blocking=True)
+                y = distance_map_label.detach().to(self.device_metrics, non_blocking=True)
+                y_pred = torch.sigmoid(d_out)
                 for metric in self.distance_metrics:
-                    metric(y_pred=torch.sigmoid(distance_map_output), y=distance_map_label)
+                    metric(y_pred, y)
+                del d_out, y, y_pred
         
-                
     def compute(self, epoch, phase="train"):
         """
         Aggregate metric buffers for this epoch and update bests.
@@ -93,44 +122,39 @@ class MetricsHelper:
         """
         results = {}
 
-        def compute_group(metrics, interval, min_epoch=None, name_postfix=""):
+        def compute_group(metrics, group_name, interval, min_epoch=None):
             group_results = {}
             if epoch % interval == 0 and (min_epoch is None or epoch >= min_epoch):
                 for m in metrics:
                     val = m.aggregate()
                     if val is None:
                         continue  # skip if metric did not accumulate any data
-
-                    # If aggregate() returns tensor, convert to scalar
                     val = val.item() if hasattr(val, "item") else val
-                    unique_name = m.__class__.__name__ + '_' + name_postfix
-                    group_results[unique_name] = val
 
-                    # Determine if higher is better
-                    name = m.__class__.__name__ #metric type name
-                    higher_is_better = self.metric_higher_is_better.get(name, True)  # default True
+                    key = self._metric_key(m, group_name)
+                    group_results[key] = val
+
+                    higher_is_better = self.metric_higher_is_better[key]
                     if higher_is_better:
-                        if val > self.best_results[phase][name]:
-                            self.best_results[phase][name] = val
+                        self.best_results[phase][key] = max(self.best_results[phase][key], val)
                     else:
-                        if val < self.best_results[phase][name]:
-                            self.best_results[phase][name] = val
+                        self.best_results[phase][key] = min(self.best_results[phase][key], val)
 
                     m.reset()  # free buffers
 
             return group_results
 
-        results.update(compute_group(self.metrics_segmentation_binary, self.args.binary_metrics_interval, name_postfix="pulp"))
-        results.update(compute_group(self.metrics_segmentation_multiclass, self.args.multiclass_metrics_interval,
-                       min_epoch=self.args.multiclass_metrics_firstTime_log, name_postfix="multiclass"))
-        results.update(compute_group(self.distance_metrics,
-                       self.args.distance_metrics_interval, name_postfix="distance"))
+        results.update(compute_group(self.metrics_segmentation_binary, self.metrics_group_names[0], self.args.binary_metrics_interval))
+        results.update(compute_group(self.metrics_segmentation_multiclass, self.metrics_group_names[1],
+                                     self.args.multiclass_metrics_interval,
+                                     min_epoch=self.args.multiclass_metrics_firstTime_log))
+        results.update(compute_group(self.distance_metrics, self.metrics_group_names[2], self.args.distance_metrics_interval))
 
         self.results[phase] = results
 
     def reset(self):
-        for group in [self.metrics_segmentation_binary, 
-                      self.metrics_segmentation_multiclass, 
+        for group in [self.metrics_segmentation_binary,
+                      self.metrics_segmentation_multiclass,
                       self.distance_metrics]:
             for m in group:
                 m.reset()
@@ -151,6 +175,9 @@ if __name__ == "__main__":
         distance_metrics_interval = 5
         multiclass_metrics_interval = 20
         multiclass_metrics_firstTime_log = 40
+        is_multiclass_one_hot = True
+        metrics_device = "cuda:1"
+        out_channels = 5 # e.g. 0, 1,...4
 
 
     args = Args()
@@ -158,25 +185,27 @@ if __name__ == "__main__":
 
     num_epochs = 100
     batch_size = 2
-    shape = (1, 16, 16, 16)
+    shape = (batch_size, 1, 16, 16, 16)
     
     binary_label = torch.randint(0, 2, size=shape).float()
-    multiclass_label = torch.randint(0, 3, size=shape).float()
+    multiclass_label = torch.randint(0, args.out_channels, size=shape).float()
     distance_map_label = torch.rand(shape)
     labels = (binary_label, multiclass_label, distance_map_label)
             
     for epoch in range(1, num_epochs+1):
-        metrics_helper.reset(phase="train")
         print(f"\n=== Epoch {epoch} ===")
 
         for batch in range(3):  # simulate 3 batches
-            # Dummy predictions and labels
-            binary_output = torch.randint(0, 2, size=shape).float()
-            multiclass_output = torch.randint(0, 3, size=shape).float()
+            # Dummy outputs
+            binary_output = torch.randn(size=shape).float()
+            multiclass_output = torch.randn(size=(batch_size, args.out_channels, *shape[2:])).float()
             distance_map_output = torch.rand(shape)
             outputs = (binary_output, multiclass_output, distance_map_output)
+            
             metrics_helper.update(outputs, labels, epoch)
 
         metrics_helper.compute(epoch, phase="train")
-        print(f"Current: {metrics_helper.get_best(phase='train')}") 
+        metrics_helper.reset()
+        
+        print(f"Current: {metrics_helper.get_current(phase='train')}") 
         print(f"Best metrics: {metrics_helper.get_best(phase='train')}")

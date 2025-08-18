@@ -66,3 +66,4 @@ logs
 test-data
 test-results
 algorithm_docker/test
+output

@@ -7,6 +7,8 @@ from monai.networks.layers.factories import Act, Norm
 
 if __name__ == "__main__":
     from resnet import get_outplanes, resnet
+elif __name__ == "model":
+    from resnet import get_outplanes, resnet
 else:
     from .resnet import get_outplanes, resnet
 

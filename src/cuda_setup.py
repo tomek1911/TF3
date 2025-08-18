@@ -61,4 +61,4 @@ def configure_cuda(use_memory_fraction: float = 0.1, num_threads: int = 8, devic
         print('\n')
 
 if __name__ == "__main__":
-    setup_cuda(use_memory_fraction=0.2, visible_devices="0")
+    configure_cuda(use_memory_fraction=0.2, visible_devices="0")
