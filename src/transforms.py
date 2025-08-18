@@ -46,15 +46,23 @@ original_to_index_map = {
     103: 43, 104: 44, 105: 45
 }
 class SaveMultipleKeysD:
-    def __init__(self, keys, output_dir, output_postfixes, separate_folder):
+    def __init__(self, keys, output_dir, output_postfixes, separate_folder, output_dtype=None):
         self.keys = keys
         self.postfixes = output_postfixes
         self.output_dir = output_dir
         self.separate_folder = separate_folder
+        self.output_dtype = output_dtype
         
     def __call__(self, data):
-        for key, postfix in zip(self.keys, self.postfixes):
-            SaveImageD(keys=[key], output_dir=self.output_dir, output_postfix=postfix, separate_folder=self.separate_folder)(data)
+        for idx, (key, postfix) in enumerate(zip(self.keys, self.postfixes)):
+            dtype = self.output_dtype[idx] if self.output_dtype is not None else None
+            SaveImageD(
+                keys=[key],
+                output_dir=self.output_dir,
+                output_postfix=postfix,
+                separate_folder=self.separate_folder,
+                output_dtype=dtype
+            )(data)
         return data
 
 def move_to_device(x, device):
@@ -233,7 +241,7 @@ class Transforms():
                         # for multiple fields, also support different orig_keys for different fields
                         nearest_interp=False,  # don't change the interpolation mode to "nearest" when inverting transforms
                         # to ensure a smooth output, then execute `AsDiscreted` transform
-                        to_tensor=True,  # convert to PyTorch Tensor after inverting
+                        to_tensor=True  # convert to PyTorch Tensor after inverting
                     ),
                     # AsDiscreteD(keys="pred", threshold=0.5),
                     # SaveImageD(keys="pred", output_dir="output", output_postfix="seg", resample=False, separate_folder=False),

@@ -296,7 +296,8 @@ def inference_step(args, batch_idx, epoch, model, scaler, data_sample, data_load
                 keys=['mlt', 'pulp', 'dist', 'dir'],
                 output_dir=epoch_dir,
                 output_postfixes=['mlt', 'pulp', 'dist', 'dir'],
-                separate_folder=False
+                separate_folder=False,
+                output_dtype=[np.uint8, np.uint8, np.float32, np.float32]
             )
             save_transform(inverted_prediction_mlt[0])
         
@@ -413,6 +414,8 @@ def main():
         model = model.to(device)
     else:
         model = model.to(device)
+        
+    # model = torch.compile(model, mode='max-autotune', fullgraph=False, dynamic=True)
     
     #LOSSES
     weights = None

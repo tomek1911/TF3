@@ -12,7 +12,7 @@ general:
 # Experiment & Logging Settings
 # --------------------------------------------------
 args:
-  comet: comet
+  comet: True
   print_config: False
   perform_test: False
   debug_data_limit: -1 #samples per datacenter: P, F, S, '-1' - no limit, use all data
