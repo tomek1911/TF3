@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 SCRIPTPATH="$( cd "$(dirname "$0")" ; pwd -P )"
-DOCKER_TAG="toothfairy3-multiinstance-algorithm_local"
+DOCKER_TAG="toothfairy3-multiinstance-algorithm"
 
 echo "Testing ToothFairy3 Multi-Instance-Segmentation algorithm from $SCRIPTPATH..."
 
@@ -40,7 +40,7 @@ done
 echo "Running algorithm Docker container..."
 docker run --rm -it \
     --gpus all \
-    --memory=32g \
+    --memory=16g \
     -v "$SCRIPTPATH/test/input":/input \
     -v "$SCRIPTPATH/test/output":/output \
     $DOCKER_TAG

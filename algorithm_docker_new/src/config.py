@@ -14,5 +14,5 @@ class Args:
     backbone_name: str = "resnet34"
     out_channels: int = 46
     classes: int = 45
-    configuration: str = "DIST_DIR_PULP"
+    configuration: str = "DIST_PULP"
     inference_autocast_dtype: str = "float16"

@@ -1,5 +1,6 @@
 from typing import Optional
 import numpy as np
+import gc
 from skimage.segmentation import watershed
 from scipy.ndimage import label, find_objects
 from skimage.measure import label, regionprops
@@ -76,20 +77,22 @@ def deep_watershed_with_voting_optimized(
         Instance segmentation with majority class voting.
     """
 
-    # Prepare markers
-    if markers is None:
-        markers = (deep_watershed_basins > seed_distance_threshold).astype(np.uint8)
+    # # Prepare markers
+    # if markers is None:
+    #     markers = (deep_watershed_basins > seed_distance_threshold).astype(np.uint8)
 
-    # Prepare binary mask
-    if binary_mask is None:
-        binary_mask = (multiclass_segmentation >= 1).astype(np.uint8)
+    # # Prepare binary mask
+    # if binary_mask is None:
+    #     binary_mask = (multiclass_segmentation >= 1).astype(np.uint8)
 
     # Label seeds
-    instances = label(markers, connectivity=3, return_num=False)
+    instances = label(markers, connectivity=3, return_num=False).astype(np.int16, copy=False).astype(np.int16, copy=False)
 
     # Apply watershed
-    instance_masks = watershed(-deep_watershed_basins, instances, mask=binary_mask)
-
+    instance_masks = watershed(-deep_watershed_basins, instances, mask=binary_mask).astype(np.int32, copy=False).astype(np.int16, copy=False)
+    del instances
+    gc.collect()
+    
     # Prepare output
     output = np.zeros_like(instance_masks, dtype=np.uint8)
 
@@ -101,21 +104,27 @@ def deep_watershed_with_voting_optimized(
             continue
 
         # Mask of current instance
-        instance_mask = (instance_masks[slc] == label_idx)
-
-        if not instance_mask.any():
+        # instance_mask = (instance_masks[slc] == label_idx)
+        
+        region = instance_masks[slc]
+        coords = np.where(region == label_idx)
+        if coords[0].size == 0:
             continue
-
+        
         # Extract corresponding voxels in multiclass segmentation
-        pred_instance = multiclass_segmentation[slc][instance_mask]
+        pred_instance = multiclass_segmentation[slc][coords]
 
         # Majority voting ignoring background
-        votes_pred = np.bincount(pred_instance)
-        majority_class_pred = 0
-        if len(votes_pred) > 1:
-            majority_class_pred = np.argmax(votes_pred[1:]) + 1
-
+        # votes_pred = np.bincount(pred_instance)
+        # majority_class_pred = 0
+        # if len(votes_pred) > 1:
+        #     majority_class_pred = np.argmax(votes_pred[1:]) + 1
         # Assign to output directly
-        output[slc][instance_mask] = majority_class_pred
+        # output[slc][coords] = majority_class_pred
+        
+        if pred_instance.size > 0:
+            votes_pred = np.bincount(pred_instance, minlength=2)
+            majority_class_pred = np.argmax(votes_pred[1:]) + 1 if votes_pred[1:].any() else 0
+            output[slc][coords] = majority_class_pred
 
     return output

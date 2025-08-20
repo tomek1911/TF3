@@ -109,10 +109,12 @@ class DWNet(nn.Module):
         
         seg_multiclass = self.multiclass_decoder(torch.cat([seg, features[-1]], dim=1))
         dist = self.dist_decoder(torch.cat([x, features[-1]], dim=1)) 
-        direction = self.direction_decoder(torch.cat([x, features[-1]], dim=1))
-        direction = f.normalize(direction, p=2.0, dim=1)
         pulp = self.pulp_decoder(torch.cat([x, features[-1]], dim=1))
-        
+        if self.training:
+            direction = self.direction_decoder(torch.cat([x, features[-1]], dim=1))
+            direction = f.normalize(direction, p=2.0, dim=1)
+            return seg_multiclass, dist, direction, pulp # IN VALDATION WIWLL BREAK - FIX IT
+        return seg_multiclass, dist, pulp
         # if self.is_edt:
         #     edt = self.edt_decoder(torch.cat([x, features[-1]], dim=1))   
         #     if self.is_dir:
@@ -124,7 +126,7 @@ class DWNet(nn.Module):
         #     edt = self._get_cached_zeros((B, 1, *s_dim), x.device)
         #     edt_direction = self._get_cached_zeros((B, 3, *s_dim), x.device)
 
-        return seg_multiclass, dist, direction, pulp
+
         
 if __name__ == "__main__":
     

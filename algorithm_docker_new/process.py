@@ -9,7 +9,7 @@ from monai.data.meta_tensor import MetaTensor
 from monai.data import decollate_batch
 from nibabel import orientations as nio
 
-# torch.cuda.set_per_process_memory_fraction(0.2, device=1) # 0.2 * 80GB = 16GB limit
+# torch.cuda.set_per_process_memory_fraction(0.2, device=1) # 0.2 * 80GB = 16GB limit; 0.19 * 80 =  15.2 GB safety margin
 
 from evalutils import SegmentationAlgorithm
 from evalutils.validators import (
@@ -96,8 +96,8 @@ class ToothFairy3_OralPharyngealSegmentation(SegmentationAlgorithm):
             self.metadata_output_path.mkdir(parents=True)
         
         # Initialize device
-        self.device = get_default_device()
-        # self.device = torch.device('cuda:1')
+        # self.device = get_default_device() # HERE CHANGE DEVICE
+        self.device = torch.device('cuda:1')
         self.args = Args()
         self.transform = Transforms(self.args, device=self.device)
         
@@ -119,7 +119,7 @@ class ToothFairy3_OralPharyngealSegmentation(SegmentationAlgorithm):
 
     @torch.no_grad()
     def predict(self, *, input_image: sitk.Image) -> sitk.Image:
-        
+        print('starting predict method')
         input_tensor = sitk_to_monai_dict(input_image, key=self.args.key)
         # print(input_tensor["image"].meta)
         # print(input_tensor["image"].shape)
