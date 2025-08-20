@@ -247,6 +247,22 @@ class Transforms():
                     # SaveImageD(keys="pred", output_dir="output", output_postfix="seg", resample=False, separate_folder=False),
                 ]
             )
+        self.post_inference_transform_no_dir = Compose(
+                [
+                    InvertD(
+                        keys=['mlt','pulp','dist'],  # invert the `pred` data field, also support multiple fields
+                        transform= self.inference_preprocessing,
+                        orig_keys="image",  # get the previously applied pre_transforms information on the `img` data field,
+                        # then invert `pred` based on this information. we can use same info
+                        # for multiple fields, also support different orig_keys for different fields
+                        nearest_interp=False,  # don't change the interpolation mode to "nearest" when inverting transforms
+                        # to ensure a smooth output, then execute `AsDiscreted` transform
+                        to_tensor=True  # convert to PyTorch Tensor after inverting
+                    ),
+                    # AsDiscreteD(keys="pred", threshold=0.5),
+                    # SaveImageD(keys="pred", output_dir="output", output_postfix="seg", resample=False, separate_folder=False),
+                ]
+            )
         self.save_inference_output = SaveMultipleKeysD(keys=['mlt','pulp','dist'], output_dir="output", output_postfixes=['mlt','pulp','dist'], separate_folder=False)
         self.save_inference_output_pred = SaveImageD(keys='pred', output_dir="output", output_postfix='pred', separate_folder=False)
         # self.save_inference_output_mlt = SaveImageD(keys="pred", output_dir="output", output_postfix="mlt", resample=False, separate_folder=False)

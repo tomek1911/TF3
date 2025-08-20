@@ -39,3 +39,4 @@ dependencies:
     - cupy-cuda11x
     - raster-geometry 
     - prettytable
+    - pip-tools

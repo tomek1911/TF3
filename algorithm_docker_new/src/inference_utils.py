@@ -134,9 +134,9 @@ def save_float_map(
     )
     saver(map_nifti, meta_dict)
     
-def merge_pulp_into_teeth(multiclass_pred: np.ndarray, 
+def merge_pulp_into_teeth(multiclass_pred: np.ndarray,
                           pulp_pred: np.ndarray, 
-                          pulp_class: int = 50, 
+                          pulp_class: int = 111, 
                           excluded_classes=None) -> np.ndarray:
     """
     Merge pulp segmentation into teeth predictions.
@@ -169,7 +169,7 @@ def merge_pulp_into_teeth(multiclass_pred: np.ndarray,
 def merge_pulp_into_teeth_torch(
     multiclass_pred: torch.Tensor,
     pulp_pred: torch.Tensor,
-    pulp_class: int = 50,
+    pulp_class: int = 111,
     excluded_classes = None,
 ) -> torch.Tensor:
     """
