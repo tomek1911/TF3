@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 SCRIPTPATH="$( cd "$(dirname "$0")" ; pwd -P )"
-DOCKER_TAG="toothfairy3-multiinstance-algorithm_2.4.0"
+DOCKER_TAG="toothfairy3-multiinstance-algorithm_local"
 
 echo "Testing ToothFairy3 Multi-Instance-Segmentation algorithm from $SCRIPTPATH..."
 
@@ -36,10 +36,11 @@ for file in "$IMAGES_DIR"/*.nii.gz; do
 done
 
 # Run the Docker container
+#limit RAM to 16 GB
 echo "Running algorithm Docker container..."
 docker run --rm -it \
     --gpus all \
-    --memory=64g \
+    --memory=32g \
     -v "$SCRIPTPATH/test/input":/input \
     -v "$SCRIPTPATH/test/output":/output \
     $DOCKER_TAG

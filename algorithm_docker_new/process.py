@@ -9,7 +9,7 @@ from monai.data.meta_tensor import MetaTensor
 from monai.data import decollate_batch
 from nibabel import orientations as nio
 
-torch.cuda.set_per_process_memory_fraction(0.2, device=1) # 0.2 * 80GB = 16GB limit
+# torch.cuda.set_per_process_memory_fraction(0.2, device=1) # 0.2 * 80GB = 16GB limit
 
 from evalutils import SegmentationAlgorithm
 from evalutils.validators import (
@@ -41,7 +41,7 @@ def sitk_to_monai_dict(img: sitk.Image, key: str = "image"):
 
     # Extract numpy array [D, H, W]
     array = sitk.GetArrayFromImage(img)
-    print("Original sitk array shape:", array.shape)
+    # print("Original sitk array shape:", array.shape)
     array = np.transpose(array, (2, 1, 0))  #  -> (W, H, D)
     affine = np.eye(4, dtype=np.float32)
     affine[0,0] = -0.3
@@ -96,8 +96,8 @@ class ToothFairy3_OralPharyngealSegmentation(SegmentationAlgorithm):
             self.metadata_output_path.mkdir(parents=True)
         
         # Initialize device
-        # self.device = get_default_device()
-        self.device = torch.device('cuda:1')
+        self.device = get_default_device()
+        # self.device = torch.device('cuda:1')
         self.args = Args()
         self.transform = Transforms(self.args, device=self.device)
         
@@ -141,9 +141,9 @@ class ToothFairy3_OralPharyngealSegmentation(SegmentationAlgorithm):
         #invert to match original
         output_array = np.transpose(output_array, (2, 1, 0))
 
-        print(f"Output shape: {output_array.shape}")
-        print(f"Output details: {output_array.max()}, {output_array.min()}")
-        print(f"Output details: {output_array.dtype}")
+        # print(f"Output shape: {output_array.shape}")
+        # print(f"Output details: {output_array.max()}, {output_array.min()}")
+        # print(f"Output details: {output_array.dtype}")
 
         output_image = sitk.GetImageFromArray(output_array)
         output_image.CopyInformation(input_image)
