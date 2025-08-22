@@ -27,12 +27,6 @@ def get_default_device():
         return torch.device('cuda')
     return torch.device('cpu')
 
-def _affine_to_axcodes_with_nibabel(affine: np.ndarray) -> str:
-    """Use nibabel to get orientation codes (e.g. ('R','A','S')) and return string 'RAS'."""
-    ornt = nio.io_orientation(affine)
-    axcodes = nio.ornt2axcodes(ornt)
-    return ''.join(axcodes)
-
 def sitk_to_monai_dict(img: sitk.Image, key: str = "image"):
     """
     Convert a SimpleITK Image into a MONAI MetaTensor-style dict
@@ -52,26 +46,7 @@ def sitk_to_monai_dict(img: sitk.Image, key: str = "image"):
         torch.as_tensor(array, dtype=torch.float32),
         affine=torch.as_tensor(affine, dtype=torch.float32)
     )
-    # tensor.meta["space"] = 'LPS' 
     return {key: tensor}
-
-
-# def your_oral_pharyngeal_segmentation_algorithm(input_tensor: torch.Tensor) -> np.ndarray:
-#     """
-#     Simple example algorithm using a single linear layer with random weights
-    
-#     Args:
-#         input_tensor: Preprocessed CBCT volume tensor [1, H, W, D]
-        
-#     Returns:
-#         Segmentation mask as numpy array
-#     """
-#     # Remove batch dimension for processing
-#     volume = input_tensor.squeeze(0)  # Remove batch dimension: [H, W, D]
-    
-#     # Return zeros with same shape as original volume (without batch dimension)
-#     return np.zeros_like(volume.cpu().numpy(), dtype=np.uint8)
-
 
 class ToothFairy3_OralPharyngealSegmentation(SegmentationAlgorithm):
     def __init__(self):
@@ -96,8 +71,8 @@ class ToothFairy3_OralPharyngealSegmentation(SegmentationAlgorithm):
             self.metadata_output_path.mkdir(parents=True)
         
         # Initialize device
-        # self.device = get_default_device() # HERE CHANGE DEVICE
-        self.device = torch.device('cuda:1')
+        self.device = get_default_device() # HERE CHANGE DEVICE
+        # self.device = torch.device('cuda:1')
         self.args = Args()
         self.transform = Transforms(self.args, device=self.device)
         
@@ -119,7 +94,7 @@ class ToothFairy3_OralPharyngealSegmentation(SegmentationAlgorithm):
 
     @torch.no_grad()
     def predict(self, *, input_image: sitk.Image) -> sitk.Image:
-        print('starting predict method')
+        # print('starting predict method')
         input_tensor = sitk_to_monai_dict(input_image, key=self.args.key)
         # print(input_tensor["image"].meta)
         # print(input_tensor["image"].shape)
@@ -130,14 +105,15 @@ class ToothFairy3_OralPharyngealSegmentation(SegmentationAlgorithm):
         # input_array = {"image": input_array}
         input_tensor = self.transform.inference_preprocessing(input_tensor)  # preprocessing
         # print(f"applied transforms: {input_tensor['image'].applied_operations}")
-        
+        # print(input_tensor["image"].shape)
         input_tensor["image"] = input_tensor["image"].unsqueeze(0) # [1, 1, H, W, D] add batch dimension, ass data_loader collate
+        # input_tensor["image"] = torch.rand(size = (1,1,768,482,326), device=self.device, dtype=torch.float16)
         # print(input_tensor["image"].meta)
         # print(input_tensor["image"].shape)
         # print(input_tensor["image"].device)
 
         output_array = run_inference(input_tensor, self.args, self.device, self.transform)
-         
+        # print(output_array.shape)
         #invert to match original
         output_array = np.transpose(output_array, (2, 1, 0))
 

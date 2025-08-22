@@ -20,7 +20,73 @@ from inference_utils import merge_pulp_into_teeth, merge_pulp_into_teeth_torch, 
 from transforms import Transforms
 from sliding_window import sliding_window_inference, _get_scan_interval, dense_patch_slices
 from model import DWNet
+from monai.transforms import SpatialCropD
 
+dtype_sizes = {
+    torch.float16: 2,
+    torch.float32: 4,
+    torch.float64: 8,
+    torch.int8: 1,
+    torch.int16: 2,
+    torch.int32: 4,
+    torch.int64: 8,
+}
+
+def inference_wrapper(args, inference_fn, model, device, input_tensor, transform, patch_size, 
+                      overlap, num_classes, prob_dtype=np.float16, mem_budget_bytes=12*1024**3):
+    """
+    Memory-aware wrapper for inference.
+    Performs hard z-split if expected prob-map exceeds mem_budget.
+    
+    Args:
+        input_tensor: torch.Tensor of shape (1, C, H, W, D)
+        patch_size: tuple (Px, Py, Pz)
+        overlap: float or tuple (for sliding window)
+        num_classes: number of segmentation classes
+        prob_dtype: float16 by default
+        mem_budget_bytes: maximum memory for prob-map
+    Returns:
+        labels: np.uint8 array of shape (H, W, D)
+    """
+    _, _, H, W, D = input_tensor["image"].shape
+    # estimate number of elements for full prob-map
+    numel = H * W * D * 48
+    bytes_needed = numel * torch.finfo(prob_dtype).bits // 8
+    
+    # if fits in memory, single pass
+    if bytes_needed <= mem_budget_bytes:
+        output_array = inference_fn(args, model, input_tensor, transform, device) # inference_step(args, model, data_sample, transform, device)
+        return output_array
+    
+    # else: need hard z-split
+    # compute safe max z-slab that fits in memory
+    max_voxels = mem_budget_bytes // (num_classes * dtype_sizes[prob_dtype])
+    z_slab_max = max_voxels // (H * W)
+    # optionally align to multiples of patch depth
+    pz = patch_size[2]
+    z_slab_max = max(pz, (z_slab_max // pz) * pz)
+    
+    # prepare z-slab ranges
+    z_starts = list(range(0, D, z_slab_max))
+    z_ranges = [(z0, min(z0 + z_slab_max, D)) for z0 in z_starts]
+    
+    # allocate final label array
+    labels = np.zeros((H, W, D), dtype=np.uint8)
+    
+    # process each slab
+    for z0, z1 in z_ranges:
+        # slab_tensor = {"image": input_tensor[:, :, :, :, z0:z1]}
+        cropper = SpatialCropD(keys="image", roi_start=(0, 0, z0), roi_end=(H, W, z1))
+        input_tensor["image"] = input_tensor["image"][0]
+        slab_tensor = cropper(input_tensor)
+        slab_tensor["image"] = slab_tensor["image"].unsqueeze(0)
+        # call main inference on slab
+        slab_output = inference_fn(args, model, slab_tensor, transform, device) 
+        
+        # store labels in correct z-range
+        labels[:, :, z0:z1] = slab_output
+    
+    return labels
 
 def memory_efficient_inference_with_overlap(
     args,
@@ -268,6 +334,43 @@ def split_infer_merge(
 
     return tuple(merged)
 
+def inference_step(args, model, data_sample, transform, device):
+    with torch.no_grad(), torch.amp.autocast(enabled=True, dtype=torch.float16, device_type=device.type):
+        
+        output = memory_efficient_inference_with_overlap(args, model, data_sample['image'], args.patch_size, device=device, overlap=0.5, 
+                                                        blend_mode="gaussian", sigma_scale=0.125, cast_dtype=torch.float16)
+        
+        #unpack output
+        (multiclass_segmentation, dist_pred, pulp_segmentation) = output # all on GPU
+        binary_mask = torch.where(multiclass_segmentation >= 1, 1, 0).to(torch.uint8)
+        markers = torch.where(dist_pred > 0.5, 1, 0).to(torch.uint8)
+        #CPU
+        dist_pred_cpu = dist_pred.squeeze().cpu()
+        multiclass_segmentation_cpu = multiclass_segmentation.squeeze().cpu()
+        binary_mask_cpu =  binary_mask.squeeze().cpu()
+        markers_cpu = markers.squeeze().cpu()
+        #post_process
+        pred_multiclass = deep_watershed_with_voting(dist_pred_cpu.numpy(), 
+                                                    multiclass_segmentation_cpu.numpy(), 
+                                                    binary_mask_cpu.numpy(), 
+                                                    markers_cpu.numpy())
+        # pred_multiclass = deep_watershed_with_voting_optimized(to_numpy(dist_pred_cpu.numpy()), 
+        #                                                        to_numpy(multiclass_segmentation_cpu.numpy()), 
+        #                                                        to_numpy(binary_mask_cpu.numpy()), 
+        #                                                        to_numpy(markers_cpu.numpy()))
+        pred_multiclass_gpu = torch.from_numpy(pred_multiclass).to(device).long() # H,W,D
+        # ---- Merge pulp and remap labels ----``
+        pred_with_pulp = merge_pulp_into_teeth_torch(pred_multiclass_gpu.squeeze(), pulp_segmentation.squeeze(), pulp_class=50).to(torch.int32)  # H,W,D
+        remapped = remap_labels_torch(pred_with_pulp, pred_to_challange_map)
+        
+        data_sample['pulp'] = MetaTensor(pulp_segmentation)
+        data_sample['dist'] = MetaTensor(dist_pred)
+        data_sample['mlt'] = MetaTensor(remapped.unsqueeze(0).unsqueeze(0)) # HERE IS CHANGED INPUT
+        inverted_prediction_mlt = [transform.post_inference_transform_no_dir(i) for i in decollate_batch(data_sample)] 
+        # inverted_prediction = transform.post_inference_transform(data_sample) 
+        transform.save_inference_output(inverted_prediction_mlt[0])
+        return remapped
+
 def main():
 
     config_file = 'config.yaml'
@@ -299,50 +402,13 @@ def main():
                                     map_location=device, weights_only=True)['model_state_dict'], strict=False)
     model = model.to(device)
     model.eval()
-
-    with torch.no_grad(), torch.amp.autocast(enabled=True, dtype=torch.float16, device_type=device.type):
-        
-        # output = split_infer_merge(data_sample["image"], args.patch_size, model, device, overlap=8, mode='gaussian', sigma_scale=0.125,
-        #                            padding_mode='constant', cval=0, progress=False)
-                
-        # output = sliding_window_inference(data_sample["image"], roi_size=args.patch_size, sw_batch_size=1, predictor=model, 
-        #                                   overlap=0.5, sw_device=device, device='cpu', mode='gaussian', sigma_scale=0.125,
-        #                                   padding_mode='constant', cval=0, progress=False)
-        # output = memory_efficient_inference(model, data_sample["image"], args.patch_size, device=device) # no overlap - direct aggregation
-        output = memory_efficient_inference_with_overlap(args, model, data_sample['image'], args.patch_size, device=device, overlap=0.5, 
-                                                         blend_mode="gaussian", sigma_scale=0.125, cast_dtype=torch.float16)
-        
-        #unpack output
-        (multiclass_segmentation, dist_pred, pulp_segmentation) = output
-        #get predictions
-        # multiclass_segmentation = multiclass_segmentation.argmax(dim=1, keepdim=True).to(torch.uint8)
-        # dist_pred = nn.Threshold(1e-3, 0)(torch.sigmoid(dist_pred)).to(torch.float32)
-        # pulp_segmentation = (torch.sigmoid(pulp_segmentation) > 0.5).to(torch.uint8)
-
-        
-        binary_mask = torch.where(multiclass_segmentation >= 1, 1, 0).to(torch.uint8)
-        markers = torch.where(dist_pred > 0.5, 1, 0).to(torch.uint8)
-        #post_process
-        # pred_multiclass = deep_watershed_with_voting(to_numpy(dist_pred.squeeze()), 
-        #                                              to_numpy(multiclass_segmentation.squeeze()), 
-        #                                              to_numpy(binary_mask.squeeze()), 
-        #                                              to_numpy(markers.squeeze()))
-        pred_multiclass = deep_watershed_with_voting_optimized(to_numpy(dist_pred.squeeze()), 
-                                                               to_numpy(multiclass_segmentation.squeeze()), 
-                                                               to_numpy(binary_mask.squeeze()), 
-                                                               to_numpy(markers.squeeze()))
-        pred_multiclass = torch.from_numpy(pred_multiclass)# H,W,D
-        # pred_final = merge_pulp_into_teeth(pred_multiclass, pulp_segmentation, pulp_class=111)
-        
-        multiclass_segmentation = merge_pulp_into_teeth_torch(pred_multiclass.squeeze(), pulp_segmentation.squeeze(), pulp_class=50).to(torch.int32)  # H,W,D
-        remapped = remap_labels_torch(multiclass_segmentation, pred_to_challange_map)
-        
-        data_sample['pulp'] = MetaTensor(pulp_segmentation)
-        data_sample['dist'] = MetaTensor(dist_pred)
-        data_sample['mlt'] = MetaTensor(remapped.unsqueeze(0).unsqueeze(0)) # HERE IS CHANGED INPUT
-        inverted_prediction_mlt = [transform.post_inference_transform_no_dir(i) for i in decollate_batch(data_sample)] 
-        # inverted_prediction = transform.post_inference_transform(data_sample) 
-        transform.save_inference_output(inverted_prediction_mlt[0])
+    
+    data_sample = {"image" : MetaTensor(torch.rand((1,1,768,768,308), dtype=torch.float16, device=device))}
+    
+    result = inference_wrapper(args, inference_step, model, device, data_sample, transform,
+                               args.patch_size, 0.25, 46, torch.float16, 14.5*1024**3)
+    
+    # result = inference_step(args, model, data_sample, transform, device)
 
 
 def sitk_to_monai(image: sitk.Image):

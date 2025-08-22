@@ -7,12 +7,155 @@ import numpy as np
 from monai.data import decollate_batch
 from monai.data.meta_tensor import MetaTensor
 import torch.nn.functional as F
-from typing import Tuple
-
+from typing import Tuple, Optional
+from monai.inferers.utils import compute_importance_map
+from .sliding_window import _get_scan_interval, dense_patch_slices
 from .sliding_window import sliding_window_inference
 from .deep_watershed import deep_watershed_with_voting_optimized
 from .inference_utils import merge_pulp_into_teeth_torch, remap_labels_torch, pred_to_challange_map
 from .model import DWNet
+
+import torch
+import numpy as np
+
+def roi_watershed_cpu(
+    dist_pred: torch.Tensor,
+    multiclass_segmentation: torch.Tensor,
+    binary_mask: torch.Tensor,
+    markers: torch.Tensor,
+    threshold: float = 0.15,
+    margin: int = 16,
+    watershed_fn=None  # your deep_watershed_with_voting_optimized
+) -> np.ndarray:
+    """
+    Apply watershed only on attention-based ROI for CPU tensors of shape [H,W,D].
+
+    Args:
+        dist_pred: attention map [H,W,D], CPU tensor
+        multiclass_segmentation: multiclass prediction [H,W,D], CPU tensor
+        binary_mask: binary mask [H,W,D], CPU tensor
+        markers: watershed markers [H,W,D], CPU tensor
+        threshold: attention threshold for ROI
+        margin: voxels to pad around ROI
+        watershed_fn: function performing watershed
+
+    Returns:
+        Full volume multiclass segmentation (np.ndarray)
+    """
+
+    # ROI mask from attention
+    roi_mask = dist_pred > threshold
+
+    if roi_mask.sum() == 0:
+        # fallback: no high-attention region
+        return watershed_fn(dist_pred.numpy(), 
+                            multiclass_segmentation.numpy(), 
+                            binary_mask.numpy(), 
+                            markers.numpy())
+
+    # Compute bounding box of ROI
+    coords = torch.nonzero(roi_mask)
+    min_coords = coords.min(dim=0)[0]
+    max_coords = coords.max(dim=0)[0]
+
+    # Add margin and clamp to image bounds
+    min_coords = torch.clamp(min_coords - margin, min=0)
+    max_coords = torch.clamp(max_coords + margin, max=torch.tensor(dist_pred.shape) - 1)
+
+    # Create slices
+    slices = tuple(slice(int(min_c), int(max_c)+1) for min_c, max_c in zip(min_coords, max_coords))
+
+    # Extract ROI
+    dist_roi = dist_pred[slices].numpy()
+    multiclass_roi = multiclass_segmentation[slices].numpy()
+    binary_roi = binary_mask[slices].numpy()
+    markers_roi = markers[slices].numpy()
+
+    # Apply watershed on ROI
+    pred_multiclass_roi = watershed_fn(dist_roi, multiclass_roi, binary_roi, markers_roi)
+
+    # Paste back into full volume
+    pred_multiclass_full = np.zeros_like(multiclass_segmentation.numpy())
+    pred_multiclass_full[slices] = pred_multiclass_roi
+
+    return pred_multiclass_full
+
+def memory_efficient_inference_with_overlap(
+    args,
+    model: nn.Module,
+    input_tensor: torch.Tensor,
+    patch_size: Tuple[int, int, int],
+    device: Optional[torch.device] = None,
+    overlap: float = 0.25,
+    blend_mode: str = "gaussian", # "gaussian" or "constant"
+    sigma_scale: float = 0.125,
+    cast_dtype = torch.float16
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Sliding-window inference with overlap + importance map (constant/gaussian).
+    Supports mixed-precision inference (float16 accumulation).
+
+    Args:
+        model: segmentation model returning (seg_multiclass, dist, _, pulp).
+        input_tensor: input image tensor [1, C, H, W, D].
+        patch_size: ROI size (ph, pw, pd).
+        stride: sliding step; defaults to (patch_size * (1 - overlap)).
+        device: device for forward pass.
+        overlap: fractional overlap between patches.
+        mode: "gaussian" or "constant" weighting for blending.
+        sigma_scale: used if mode="gaussian"; sigma = sigma_scale * dim_size.
+
+    Returns:
+        multiclass_output: [1,1,H,W,D] uint8 (argmax)
+        dist_output:       [1,1,H,W,D] float16
+        pulp_output:       [1,1,H,W,D] uint8
+    """
+
+    _, _, H, W, D = input_tensor.shape
+
+    # Calculate scan intervals
+    overlap = overlap if isinstance(overlap, (tuple, list)) else tuple([overlap]*len(patch_size))
+    scan_interval = _get_scan_interval((H, W, D), patch_size, len(patch_size), overlap)
+    
+    # Enumerate all slices defining patches
+    slices = dense_patch_slices((H, W, D), patch_size, scan_interval)
+
+    # Preallocate accumulators
+    sum_probs = torch.zeros((1, args.out_channels, H, W, D), dtype=cast_dtype, device="cpu")
+    sum_weights = torch.zeros((1, 1, H, W, D), dtype=cast_dtype, device=device)
+    dist_output = torch.zeros((1, 1, H, W, D), dtype=cast_dtype, device=device)
+    pulp_output = torch.zeros((1, 1, H, W, D), dtype=cast_dtype,  device=device)
+
+    # Create importance map (on device, but small, then copy to cpu when needed)
+    importance_map = compute_importance_map(
+        patch_size, mode=blend_mode, sigma_scale=sigma_scale, device=device, dtype=cast_dtype
+    )  # [ph, pw, pd]
+    importance_map = importance_map.unsqueeze(0).unsqueeze(0)  # [1,1,ph,pw,pd]
+
+    with torch.no_grad():
+        for s in slices:
+            # Extract patch
+            patch = input_tensor[:, :, s[0], s[1], s[2]]
+
+            # Forward pass
+            seg_multiclass, dist, pulp = model(patch)
+
+            # Apply importance map
+            w_patch = importance_map[:, :, :seg_multiclass.shape[2], :seg_multiclass.shape[3], :seg_multiclass.shape[4]]
+            seg_multiclass = torch.softmax(seg_multiclass, dim=1).to(cast_dtype) * w_patch
+            dist = torch.sigmoid(dist).to(cast_dtype) * w_patch
+            pulp = torch.sigmoid(pulp).to(cast_dtype) * w_patch
+
+            # Accumulate results
+            sum_weights[:, :, s[0], s[1], s[2]] += w_patch # GPU stored
+            sum_probs[:, :, s[0], s[1], s[2]] += seg_multiclass.cpu()
+            dist_output[:, :, s[0], s[1], s[2]] += dist # GPU stored
+            pulp_output[:, :, s[0], s[1], s[2]] += pulp # GPU stored
+
+    # Final post-processing
+    return (sum_probs / sum_weights.cpu().clamp(min=1e-6)).argmax(dim=1, keepdim=True).to(dtype=torch.uint8, device=device), \
+            nn.Threshold(1e-3, 0)(dist_output / sum_weights.clamp(min=1e-6)).to(cast_dtype), \
+            (pulp_output / sum_weights.clamp(min=1e-6) > 0.5).to(torch.uint8)
 
 def memory_efficient_inference(
     model: nn.Module,
@@ -138,7 +281,7 @@ def split_infer_merge(
 
     # Run inference on each half
     with torch.no_grad(), torch.amp.autocast(enabled=True, dtype=torch.float16, device_type=device.type):
-        print("pred top inference")
+        # print("pred top inference")
         pred_top = sliding_window_inference(
             top_half, roi_size=roi_size, sw_batch_size=sw_batch_size,
             predictor=model, sw_device=device, device=device, **kwargs
@@ -149,8 +292,7 @@ def split_infer_merge(
         gc.collect()
         torch.cuda.empty_cache()
         
-        print("pred bottom inference")
-        
+        # print("pred bottom inference")        
         pred_bottom = sliding_window_inference(
             bottom_half, roi_size=roi_size, sw_batch_size=sw_batch_size,
             predictor=model, sw_device=device, device=device, **kwargs
@@ -188,18 +330,18 @@ def split_infer_merge(
     return tuple(merged)
 
 def run_inference(input_tensor, args, device, transform) -> np.ndarray:
-    print("loading model...")
+    # print("loading model...")
        
     model = DWNet(spatial_dims=3, in_channels=1, out_channels=args.out_channels, act=args.activation, norm=args.norm,
                 bias=False, backbone_name=args.backbone_name, configuration=args.configuration)
-    missing_keys, unexpected_keys = model.load_state_dict(torch.load('checkpoints/model_epoch_260.pth',
+    _, _ = model.load_state_dict(torch.load('checkpoints/model_epoch_380.pth',
                                     map_location=device, weights_only=True)['model_state_dict'], strict=False) #dir decoder weights are dropped
     model = model.to(device)
     model.eval()
 
     with torch.no_grad(), torch.amp.autocast(enabled=True, dtype=torch.float16, device_type=device.type):
-        num_voxels = input_tensor["image"].numel()
-        print(f"Running inference on input tensor with numel: {num_voxels}...")
+        # num_voxels = input_tensor["image"].numel()
+        # print(f"Running inference on input tensor with numel: {num_voxels}...")
        
         # if num_voxels > 40000000:
         #     output = split_infer_merge(input_tensor["image"], args.patch_size, model, device, split_overlap=4, mode='gaussian', overlap=0.1, sigma_scale=0.125,
@@ -210,7 +352,12 @@ def run_inference(input_tensor, args, device, transform) -> np.ndarray:
         #                                     padding_mode='constant', cval=0, progress=False)
         #     output = tuple(t.cpu() for t in output)
         
-        output = memory_efficient_inference(model, input_tensor["image"], args.patch_size, device=device)
+        # output = memory_efficient_inference(model, input_tensor["image"], args.patch_size, device=device)
+        # print("run sliding inference")
+        output = memory_efficient_inference_with_overlap(args, model, input_tensor['image'], args.patch_size, device=device, overlap=0.5, 
+                                                         blend_mode="gaussian", sigma_scale=0.125, cast_dtype=torch.float16)
+        
+        #unpack output
         #delete model to free memory
         del model
         gc.collect()
@@ -218,8 +365,11 @@ def run_inference(input_tensor, args, device, transform) -> np.ndarray:
 
         # Unpack output and move to GPU
                 
-        print("move to GPU")
+        # print("move to GPU")
         (multiclass_segmentation, dist_pred, pulp_segmentation) = output
+        # print(f"seg device: {multiclass_segmentation.device}")
+        # multiclass_segmentation = multiclass_segmentation.to(device)
+        # pulp_segmentation = pulp_segmentation.to(device)
         # seg_multiclass = seg_multiclass.to(device)
         # dist = dist.to(device)
         # pulp = pulp.to(device)  
@@ -237,7 +387,7 @@ def run_inference(input_tensor, args, device, transform) -> np.ndarray:
         
     # ---- Move only necessary tensors to CPU for watershed ----
             
-    print("move to CPU")
+    # print("move to CPU")
     dist_pred_cpu = dist_pred.squeeze().cpu()
     multiclass_segmentation_cpu = multiclass_segmentation.squeeze().cpu()
     binary_mask_cpu =  binary_mask.squeeze().cpu()
@@ -248,20 +398,25 @@ def run_inference(input_tensor, args, device, transform) -> np.ndarray:
     torch.cuda.empty_cache()
     
     # ---- CPU-based watershed (memory-intensive) ----
-    print("run Watershed")
+    # print("run Watershed")
+    # FULL volume watershed
     pred_multiclass = deep_watershed_with_voting_optimized(dist_pred_cpu.numpy(), 
-                                                            multiclass_segmentation_cpu.numpy(), 
-                                                            binary_mask_cpu.numpy(),
-                                                            markers_cpu.numpy())
+                                                           multiclass_segmentation_cpu.numpy(), 
+                                                           binary_mask_cpu.numpy(),
+                                                           markers_cpu.numpy())
+    # attention based ROI watershed
+    # USE AS LAST OPTION - UNSAFE
+    # pred_multiclass = roi_watershed_cpu(dist_pred_cpu, multiclass_segmentation_cpu,
+    #                                   binary_mask_cpu, markers_cpu, threshold=0.2, watershed_fn=deep_watershed_with_voting_optimized)
     # Free CPU copies used for watershed
     del dist_pred_cpu, multiclass_segmentation_cpu, binary_mask_cpu, markers_cpu
     gc.collect()
     
     with torch.no_grad():
         # ---- Move watershed result back to GPU ----
-        print("merge segmentations")
+        # print("merge segmentations")
         pred_multiclass_gpu = torch.from_numpy(pred_multiclass).long().to(device)
-        pulp_segmentation = pulp_segmentation.to(device)
+        # pulp_segmentation = pulp_segmentation.to(device)
         del pred_multiclass
         gc.collect()   
     
@@ -280,8 +435,8 @@ def run_inference(input_tensor, args, device, transform) -> np.ndarray:
         # output_array = [transform.post_inference_transform(i) for i in decollate_batch(input_tensor)] #transform cannot operate on a batch, we need C,H,W,D
     # return output_array[0].numpy().astype(np.uint8)  # Convert to numpy array and return
         
-if __name__ ==  "__main__":
-    start_time_epoch = time.time()
-    run_inference()
-    inference_time=time.time() - start_time_epoch
-    print(f"Inference took: {inference_time:.2f}s.")
+# if __name__ ==  "__main__":
+#     start_time_epoch = time.time()
+#     run_inference()
+#     inference_time=time.time() - start_time_epoch
+#     print(f"Inference took: {inference_time:.2f}s.")

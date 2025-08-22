@@ -39,7 +39,7 @@ class Transforms():
                         keys='pred',
                         transform= self.inference_preprocessing,
                         orig_keys="image",
-                        nearest_interp=False,
+                        nearest_interp=True,
                         to_tensor=True
                     ),
                     # AsDiscreteD(keys="pred", threshold=0.5)
