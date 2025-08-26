@@ -7,8 +7,10 @@ import numpy as np
 from monai.data import decollate_batch
 from monai.data.meta_tensor import MetaTensor
 import torch.nn.functional as F
+from copy import copy
 from typing import Tuple, Optional
 from monai.inferers.utils import compute_importance_map
+from monai.transforms import SpatialCropD
 from .sliding_window import _get_scan_interval, dense_patch_slices
 from .sliding_window import sliding_window_inference
 from .deep_watershed import deep_watershed_with_voting_optimized
@@ -17,6 +19,134 @@ from .model import DWNet
 
 import torch
 import numpy as np
+
+dtype_sizes = {
+    torch.float16: 2,
+    torch.float32: 4,
+    torch.float64: 8,
+    torch.int8: 1,
+    torch.int16: 2,
+    torch.int32: 4,
+    torch.int64: 8,
+}
+
+def load_model(args, device):
+    model = DWNet(spatial_dims=3, in_channels=1, out_channels=args.out_channels, act=args.activation, norm=args.norm,
+                bias=False, backbone_name=args.backbone_name, configuration=args.configuration)
+    _, _ = model.load_state_dict(torch.load('checkpoints/model_epoch_380.pth',
+                                    map_location=device, weights_only=True)['model_state_dict'], strict=False) #dir decoder weights are dropped
+    model = model.to(device)
+    model.eval()
+    return model
+
+def inference_wrapper(args, inference_fn, model, device, input_tensor, transform, patch_size, 
+                      overlap, num_classes, prob_dtype=np.float16, mem_budget_bytes=12*1024**3):
+    """
+    Memory-aware wrapper for inference.
+    Performs hard z-split if expected prob-map exceeds mem_budget.
+    
+    Args:
+        input_tensor: torch.Tensor of shape (1, C, H, W, D)
+        patch_size: tuple (Px, Py, Pz)
+        overlap: float or tuple (for sliding window)
+        num_classes: number of segmentation classes
+        prob_dtype: float16 by default
+        mem_budget_bytes: maximum memory for prob-map
+    Returns:
+        labels: np.uint8 array of shape (H, W, D)
+    """
+    _, _, H, W, D = input_tensor["image"].shape
+    # estimate number of elements for full prob-map
+    numel = H * W * D * num_classes
+    bytes_needed = numel * torch.finfo(prob_dtype).bits // 8
+    
+    # if fits in memory, single pass
+    if bytes_needed <= mem_budget_bytes:
+        print("single step forward")
+        labels = inference_fn(args, model, input_tensor, device) # inference_step(args, model, data_sample, transform, device)
+        prediction = transform.post_inference_transform({"pred": MetaTensor(labels).unsqueeze(0), "image": input_tensor["image"][0]})["pred"] # B,H,W,D
+        return prediction.squeeze().cpu().numpy().astype(np.uint8) # H,W,D
+    
+    print("multistep forward")
+    # else: need hard z-split
+    # compute safe max z-slab that fits in memory
+    # print("memory too low, using slab inference")
+    # max_voxels = mem_budget_bytes // (num_classes * dtype_sizes[prob_dtype])
+    # z_slab_max = max_voxels // (H * W)
+    # # optionally align to multiples of patch depth
+    # pz = patch_size[2]
+    # # z_slab_max = max(pz, (z_slab_max // pz) * pz)
+    
+    # # prepare z-slab ranges
+    # # z_starts = list(range(0, D, z_slab_max))
+    # # z_ranges = [(z0, min(z0 + z_slab_max, D)) for z0 in z_starts]
+    
+    # slab = min(z_slab_max, pz) if z_slab_max < 2*pz else z_slab_max  # keep it a multiple of Pz
+    # If you want strictly fixed Pz-depth slabs, set: slab = Pz
+
+    slab = patch_size[2] # step is always patch size z axis, cannot be less 
+    plan = plan_z_slabs(D, slab)
+    
+    # allocate final label array
+    labels = np.zeros((H, W, D), dtype=np.uint8)
+    
+    # process each slab
+    for (zin0, zin1), (zout0, zout1) in plan:
+        print("performing slab inference")
+        # slab_tensor = {"image": input_tensor[:, :, :, :, z0:z1]}
+        # cropper = SpatialCropD(keys="image", roi_start=(0, 0, zin0), roi_end=(H, W, zin1))
+        slab_tensor = {"image": input_tensor["image"][:, :, :, :, zin0:zin1]}
+        print(slab_tensor['image'].shape, slab_tensor['image'].device)
+        # call main inference on slab
+        # slab_output = inference_fn(args, model, slab_tensor, transform, device) 
+        
+        print("run step forward")
+        slab_labels=inference_fn(args, model, slab_tensor,
+                                 device).squeeze().to(torch.uint8).cpu().numpy()
+        #assign slab fragment to final output
+        off0 = zout0 - zin0
+        off1 = zout1 - zin1  # negative or zero
+        # if off1 != 0:
+        #     slab_sub = slab_labels[:, :, off0:slab_labels.shape[2]+off1]
+        # else:
+        #     slab_sub = slab_labels[:, :, off0:]
+        # labels[:, :, zout0:zout1] = slab_sub
+        if off1 != 0:
+            labels[:, :, zout0:zout1] = slab_labels[:, :, off0:slab_labels.shape[2] + off1]
+        else:
+            labels[:, :, zout0:zout1] = slab_labels[:, :, off0:]
+        # Explicitly drop temporaries to keep RAM smooth
+    
+    # input_tensor["pred"] = MetaTensor(labels).unsqueeze(0).unsqueeze(0)
+    # result = [transform.pred_transform(i) for i in decollate_batch(input_tensor)][0]['pred'] 
+      
+    prediction = transform.post_inference_transform({"pred": MetaTensor(labels).unsqueeze(0), "image": input_tensor["image"][0]})["pred"] # B,H,W,D
+    return prediction.squeeze().to(torch.uint8).cpu().numpy() # H,W,D
+
+def plan_z_slabs(D: int, slab: int):
+    """
+    Return a list of ((z_in0, z_in1), (z_out0, z_out1)) tuples.
+    - z_in*:  slice passed to the model (always length == slab)
+    - z_out*: sub-slice to write into the final volume to avoid overlaps
+    """
+    if D <= slab:
+        # Single pass; no splitting. In+out are identical.
+        return [((0, D), (0, D))]
+
+    # Start positions spaced by `slab`, then force last start to be D - slab (end-aligned).
+    starts = list(range(0, max(D - slab, 0) + 1, slab))
+    last_start = D - slab
+    if starts[-1] != last_start:
+        starts.append(last_start)
+
+    # Build (in, out) pairs: write [start_i : start_{i+1}], last writes [start_last : D]
+    plan = []
+    for i, s in enumerate(starts):
+        z_in0, z_in1 = s, s + slab              # always slab deep
+        z_out0 = s
+        z_out1 = starts[i + 1] if i + 1 < len(starts) else D
+        plan.append(((z_in0, z_in1), (z_out0, z_out1)))
+    return plan
 
 def roi_watershed_cpu(
     dist_pred: torch.Tensor,
@@ -354,7 +484,7 @@ def run_inference(input_tensor, args, device, transform) -> np.ndarray:
         
         # output = memory_efficient_inference(model, input_tensor["image"], args.patch_size, device=device)
         # print("run sliding inference")
-        output = memory_efficient_inference_with_overlap(args, model, input_tensor['image'], args.patch_size, device=device, overlap=0.25, 
+        output = memory_efficient_inference_with_overlap(args, model, input_tensor['image'], args.patch_size, device=device, overlap=0.5, 
                                                          blend_mode="gaussian", sigma_scale=0.125, cast_dtype=torch.float16)
         
         #unpack output
@@ -435,6 +565,51 @@ def run_inference(input_tensor, args, device, transform) -> np.ndarray:
         # output_array = [transform.post_inference_transform(i) for i in decollate_batch(input_tensor)] #transform cannot operate on a batch, we need C,H,W,D
     # return output_array[0].numpy().astype(np.uint8)  # Convert to numpy array and return
         
+def inference_step(args, model, data_sample, device):
+    with torch.no_grad(), torch.amp.autocast(enabled=True, dtype=torch.float16, device_type=device.type):
+        
+        output = memory_efficient_inference_with_overlap(args, model, data_sample['image'], args.patch_size, device=device, overlap=0.5, 
+                                                        blend_mode="gaussian", sigma_scale=0.125, cast_dtype=torch.float16)
+        
+        #unpack output
+        print("postprocessing")
+        (multiclass_segmentation, dist_pred, pulp_segmentation) = output # all on GPU
+        binary_mask = torch.where(multiclass_segmentation >= 1, 1, 0).to(torch.uint8)
+        markers = torch.where(dist_pred > 0.5, 1, 0).to(torch.uint8)
+        #CPU
+        dist_pred_cpu = dist_pred.squeeze().cpu()
+        multiclass_segmentation_cpu = multiclass_segmentation.squeeze().cpu()
+        binary_mask_cpu =  binary_mask.squeeze().cpu()
+        markers_cpu = markers.squeeze().cpu()
+        
+        del multiclass_segmentation, binary_mask, dist_pred, markers
+        torch.cuda.empty_cache()
+    
+        #post_process
+        pred_multiclass = deep_watershed_with_voting_optimized(dist_pred_cpu.numpy(), 
+                                                                multiclass_segmentation_cpu.numpy(), 
+                                                                binary_mask_cpu.numpy(), 
+                                                                markers_cpu.numpy())
+        
+        
+        del dist_pred_cpu, multiclass_segmentation_cpu, binary_mask_cpu, markers_cpu
+        gc.collect()
+        # pred_multiclass = deep_watershed_with_voting_optimized(to_numpy(dist_pred_cpu.numpy()), 
+        #                                                        to_numpy(multiclass_segmentation_cpu.numpy()), 
+        #                                                        to_numpy(binary_mask_cpu.numpy()), 
+        #                                                        to_numpy(markers_cpu.numpy()))
+        pred_multiclass_gpu = torch.from_numpy(pred_multiclass).to(device).long() # H,W,D
+        del pred_multiclass
+        gc.collect()   
+        # ---- Merge pulp and remap labels ----``
+        pred_with_pulp = merge_pulp_into_teeth_torch(pred_multiclass_gpu.squeeze(), pulp_segmentation.squeeze(), pulp_class=50).to(torch.int32)  # H,W,D
+        remapped = remap_labels_torch(pred_with_pulp, pred_to_challange_map)
+        
+        del pred_with_pulp, pred_multiclass_gpu, pulp_segmentation
+        torch.cuda.empty_cache()   
+        
+        return remapped
+            
 # if __name__ ==  "__main__":
 #     start_time_epoch = time.time()
 #     run_inference()

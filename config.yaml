@@ -73,7 +73,7 @@ args:
     - image
     - label
     - watershed_map
-  pixdim: 0.3
+  pixdim: 0.2
   houndsfield_clip: 3000
   patch_size: 
     - 288

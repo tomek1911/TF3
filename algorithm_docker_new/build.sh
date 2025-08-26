@@ -3,7 +3,7 @@
 SCRIPTPATH="$( cd "$(dirname "$0")" ; pwd -P )"
 DOCKER_TAG="toothfairy3-multiinstance-algorithm"
 
-## LOCAL VERSION
+# LOCAL VERSION
 
 # HOST_UID=$(id -u)
 # HOST_GID=$(id -g)
@@ -17,7 +17,7 @@ DOCKER_TAG="toothfairy3-multiinstance-algorithm"
 #     --build-arg HOST_GID=$HOST_GID \
 #     --tag $DOCKER_TAG
 
-## CHALLENGE VERSION
+# CHALLENGE VERSION
 
 echo "Building CHALLENGE $DOCKER_TAG ToothFairy3 Multi-Instance-Segmentation algorithm Docker image..."
 

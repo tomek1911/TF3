@@ -9,6 +9,7 @@ import numpy as np
 import gc
 import SimpleITK as sitk
 # from monai.inferers import sliding_window_inference
+from copy import copy
 from monai.data import DataLoader, decollate_batch
 from monai.data.dataset import Dataset
 from monai.data.meta_tensor import MetaTensor
@@ -32,6 +33,31 @@ dtype_sizes = {
     torch.int64: 8,
 }
 
+def plan_z_slabs(D: int, slab: int):
+    """
+    Return a list of ((z_in0, z_in1), (z_out0, z_out1)) tuples.
+    - z_in*:  slice passed to the model (always length == slab)
+    - z_out*: sub-slice to write into the final volume to avoid overlaps
+    """
+    if D <= slab:
+        # Single pass; no splitting. In+out are identical.
+        return [((0, D), (0, D))]
+
+    # Start positions spaced by `slab`, then force last start to be D - slab (end-aligned).
+    starts = list(range(0, max(D - slab, 0) + 1, slab))
+    last_start = D - slab
+    if starts[-1] != last_start:
+        starts.append(last_start)
+
+    # Build (in, out) pairs: write [start_i : start_{i+1}], last writes [start_last : D]
+    plan = []
+    for i, s in enumerate(starts):
+        z_in0, z_in1 = s, s + slab              # always slab deep
+        z_out0 = s
+        z_out1 = starts[i + 1] if i + 1 < len(starts) else D
+        plan.append(((z_in0, z_in1), (z_out0, z_out1)))
+    return plan
+
 def inference_wrapper(args, inference_fn, model, device, input_tensor, transform, patch_size, 
                       overlap, num_classes, prob_dtype=np.float16, mem_budget_bytes=12*1024**3):
     """
@@ -50,43 +76,57 @@ def inference_wrapper(args, inference_fn, model, device, input_tensor, transform
     """
     _, _, H, W, D = input_tensor["image"].shape
     # estimate number of elements for full prob-map
-    numel = H * W * D * 48
+    numel = H * W * D * num_classes
     bytes_needed = numel * torch.finfo(prob_dtype).bits // 8
     
     # if fits in memory, single pass
     if bytes_needed <= mem_budget_bytes:
-        output_array = inference_fn(args, model, input_tensor, transform, device) # inference_step(args, model, data_sample, transform, device)
-        return output_array
+        labels = inference_fn(args, model, input_tensor, transform, device) # inference_step(args, model, data_sample, transform, device)
+        input_tensor["pred"] = MetaTensor(labels).unsqueeze(0).unsqueeze(0)
+        result = [transform.pred_transform(i) for i in decollate_batch(input_tensor)][0]['pred'] 
+        return result.squeeze().cpu().numpy().astype(np.uint8)
     
     # else: need hard z-split
     # compute safe max z-slab that fits in memory
     max_voxels = mem_budget_bytes // (num_classes * dtype_sizes[prob_dtype])
     z_slab_max = max_voxels // (H * W)
-    # optionally align to multiples of patch depth
     pz = patch_size[2]
-    z_slab_max = max(pz, (z_slab_max // pz) * pz)
-    
-    # prepare z-slab ranges
-    z_starts = list(range(0, D, z_slab_max))
-    z_ranges = [(z0, min(z0 + z_slab_max, D)) for z0 in z_starts]
+    # slab = min(z_slab_max, pz) if z_slab_max < 2*pz else z_slab_max
+    slab = pz[2] #z step is always patch size, cannot be smaller
+
+    plan = plan_z_slabs(D, slab)
     
     # allocate final label array
     labels = np.zeros((H, W, D), dtype=np.uint8)
     
     # process each slab
-    for z0, z1 in z_ranges:
+    for (zin0, zin1), (zout0, zout1) in plan:
         # slab_tensor = {"image": input_tensor[:, :, :, :, z0:z1]}
-        cropper = SpatialCropD(keys="image", roi_start=(0, 0, z0), roi_end=(H, W, z1))
-        input_tensor["image"] = input_tensor["image"][0]
-        slab_tensor = cropper(input_tensor)
+        cropper = SpatialCropD(keys="image", roi_start=(0, 0, zin0), roi_end=(H, W, zin1))
+        #shallow copy
+        slab_tensor = copy(input_tensor)
+        slab_tensor["image"] = input_tensor["image"][0]
+        slab_tensor = cropper(slab_tensor)
         slab_tensor["image"] = slab_tensor["image"].unsqueeze(0)
         # call main inference on slab
-        slab_output = inference_fn(args, model, slab_tensor, transform, device) 
+        # slab_output = inference_fn(args, model, slab_tensor, transform, device) 
         
-        # store labels in correct z-range
-        labels[:, :, z0:z1] = slab_output
+        slab_labels=inference_fn(args, model, slab_tensor, transform, device).cpu().numpy().astype(np.uint8)
+        #assign slab fragment to final output
+        off0 = zout0 - zin0
+        off1 = zout1 - zin1  # negative or zero
+        if off1 != 0:
+            slab_sub = slab_labels[:, :, off0:slab_labels.shape[2]+off1]
+        else:
+            slab_sub = slab_labels[:, :, off0:]
+        labels[:, :, zout0:zout1] = slab_sub
+
+        # Explicitly drop temporaries to keep RAM smooth
+        del slab_sub, slab_labels, slab_tensor
     
-    return labels
+    input_tensor["pred"] = MetaTensor(labels).unsqueeze(0).unsqueeze(0)
+    result = [transform.pred_transform(i) for i in decollate_batch(input_tensor)][0]['pred'] 
+    return result.squeeze().cpu().numpy().astype(np.uint8)
 
 def memory_efficient_inference_with_overlap(
     args,
@@ -165,7 +205,6 @@ def memory_efficient_inference_with_overlap(
     return (sum_probs / sum_weights.cpu().clamp(min=1e-6)).argmax(dim=1, keepdim=True).to(dtype=torch.uint8, device=device), \
             nn.Threshold(1e-3, 0)(dist_output / sum_weights.clamp(min=1e-6)).to(cast_dtype), \
             (pulp_output / sum_weights.clamp(min=1e-6) > 0.5).to(torch.uint8)
-
 
 def memory_efficient_inference(
     model: nn.Module,
@@ -250,7 +289,6 @@ def memory_efficient_inference(
                     pulp_output[:, :, h0:h1, w0:w1, d0:d1] =  pulp_patch[:, :, :h_end, :w_end, :d_end].cpu()
 
     return multiclass_output, dist_output, pulp_output
-
 
 def split_infer_merge(
     image: torch.Tensor,
@@ -363,12 +401,14 @@ def inference_step(args, model, data_sample, transform, device):
         pred_with_pulp = merge_pulp_into_teeth_torch(pred_multiclass_gpu.squeeze(), pulp_segmentation.squeeze(), pulp_class=50).to(torch.int32)  # H,W,D
         remapped = remap_labels_torch(pred_with_pulp, pred_to_challange_map)
         
-        data_sample['pulp'] = MetaTensor(pulp_segmentation)
-        data_sample['dist'] = MetaTensor(dist_pred)
-        data_sample['mlt'] = MetaTensor(remapped.unsqueeze(0).unsqueeze(0)) # HERE IS CHANGED INPUT
-        inverted_prediction_mlt = [transform.post_inference_transform_no_dir(i) for i in decollate_batch(data_sample)] 
-        # inverted_prediction = transform.post_inference_transform(data_sample) 
-        transform.save_inference_output(inverted_prediction_mlt[0])
+        #sace results to disk
+        # data_sample['pulp'] = MetaTensor(pulp_segmentation)
+        # data_sample['dist'] = MetaTensor(dist_pred)
+        # data_sample['mlt'] = MetaTensor(remapped.unsqueeze(0).unsqueeze(0)) # HERE IS CHANGED INPUT
+        # inverted_prediction_mlt = [transform.post_inference_transform_no_dir(i) for i in decollate_batch(data_sample)] 
+        # # inverted_prediction = transform.post_inference_transform(data_sample) 
+        # transform.save_inference_output(inverted_prediction_mlt[0])
+        
         return remapped
 
 def main():
@@ -389,11 +429,18 @@ def main():
 
     device = get_default_device()
     transform = Transforms(args, device=device)
-    input_image = {"image" : "data/imagesTr/ToothFairy3P_381_0000.nii.gz"}
+    # input_image = {"image" : "data/imagesTr/ToothFairy3P_381_0000.nii.gz"}
+    input_image = {"image" : "data/imagesTr/ToothFairy3F_001_0000.nii.gz"}
     
     dataset = Dataset(data=[input_image], transform=transform.inference_preprocessing)
     dataloader = DataLoader(dataset, batch_size=1, num_workers=0)
     data_sample = next(iter(dataloader))
+    
+    max_voxels = 10*1024**3 // (48 * 2)
+    z_slab_max = max_voxels // (data_sample["image"].shape[-3] * data_sample["image"].shape[-2])
+    pz = args.patch_size[2]
+    if z_slab_max < pz:
+        print("pixdim should be lower, cannot fit in RAM single patch_size z layer")
     
     # data_sample = transform.inference_preprocessing(input_image)
     model = DWNet(spatial_dims=3, in_channels=1, out_channels=args.out_channels, act=args.activation, norm=args.norm,
@@ -403,10 +450,10 @@ def main():
     model = model.to(device)
     model.eval()
     
-    data_sample = {"image" : MetaTensor(torch.rand((1,1,768,768,308), dtype=torch.float16, device=device))}
-    
+    # data_sample = {"image" : MetaTensor(torch.rand((1,1,768,768,348), dtype=torch.float16, device=device))}
+    #num classes = bg + 45 teeth + dist_map + pulp = 48 classes
     result = inference_wrapper(args, inference_step, model, device, data_sample, transform,
-                               args.patch_size, 0.25, 46, torch.float16, 14.5*1024**3)
+                               args.patch_size, 0.25, 48, torch.float16, 7*1024**3)
     
     # result = inference_step(args, model, data_sample, transform, device)
 

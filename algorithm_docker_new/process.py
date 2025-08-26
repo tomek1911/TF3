@@ -19,6 +19,7 @@ from evalutils.validators import (
 
 from src.config import Args
 from src.inference import run_inference
+# from src.inference_slab import load_model, inference_wrapper, inference_step
 from src.transforms import Transforms
 
 def get_default_device():
@@ -96,21 +97,49 @@ class ToothFairy3_OralPharyngealSegmentation(SegmentationAlgorithm):
     def predict(self, *, input_image: sitk.Image) -> sitk.Image:
         # print('starting predict method')
         input_tensor = sitk_to_monai_dict(input_image, key=self.args.key)
-        # print(input_tensor["image"].meta)
-        # print(input_tensor["image"].shape)
-        # print(input_tensor["image"].device)
-        # input_array = sitk.GetArrayFromImage(input_image) # np.array
-        # input_array = np.expand_dims(input_array, axis=0)  # Add batch dimension: [1, H, W, D]
-        # print(input_array.shape)
-        # input_array = {"image": input_array}
-        input_tensor = self.transform.inference_preprocessing(input_tensor)  # preprocessing
-        # print(f"applied transforms: {input_tensor['image'].applied_operations}")
-        # print(input_tensor["image"].shape)
+        
+        # budget_ram = 12*1024**3
+        # # print(input_tensor["image"].shape)
+        # # max_voxels = budget_ram // (48 * 2) #  8GiB = ~90mln pikseli float16, ~512x512x265 = 70 mln pikseli
+        # # H, W, D = input_tensor["image"].shape
+        # # z_slab_max = max_voxels // (H * W)
+        # # # print(z_slab_max)
+        # # pz = self.args.patch_size[2]
+        # H, W, D = input_tensor["image"].shape
+        # memory_needs = H * W * D * 48 * 2
+        # if budget_ram < memory_needs:
+        #     print("Scan too big, down-sampling to 0.35 mm/px.")
+        #     self.transform.inference_preprocessing.transforms[2].spacing_transform.pixdim = np.array([0.35,0.35,0.35])
+
+
+        budget_ram = 6.0 * 1024**3   # GiB
+        channels = 48
+        bytes_per_voxel = 2         # float16
+
+        H, W, D = input_tensor["image"].shape
+        current_voxels = H * W * D
+        max_voxels = budget_ram // (channels * bytes_per_voxel)
+
+        if current_voxels > max_voxels:
+            scale_factor = (max_voxels / current_voxels) ** (1/3)
+            old_pixdim = 0.3
+            new_pixdim = old_pixdim / scale_factor
+            print(f"Scan too big, down-sampling with scale {scale_factor:.3f}, new pixdim = {new_pixdim}")
+            self.transform.inference_preprocessing.transforms[2].spacing_transform.pixdim = new_pixdim
+        else:
+            print("Scan fits in memory, keeping original resolution.")
+
+        input_tensor = self.transform.inference_preprocessing(input_tensor)
         input_tensor["image"] = input_tensor["image"].unsqueeze(0) # [1, 1, H, W, D] add batch dimension, ass data_loader collate
-        # input_tensor["image"] = torch.rand(size = (1,1,768,482,326), device=self.device, dtype=torch.float16)
-        # print(input_tensor["image"].meta)
-        # print(input_tensor["image"].shape)
-        # print(input_tensor["image"].device)
+        print(f"input image size: {input_tensor['image'].shape}")
+        # input_tensor["image"] = MetaTensor(torch.rand(size = (1,1,768,482,326), device=self.device, dtype=torch.float16))
+        
+
+
+        # WRAPPER
+        # model = load_model(self.args, self.device)
+        # output_array = inference_wrapper(self.args, inference_step, model, self.device, input_tensor, self.transform, self.args.patch_size,
+        #                   0.25, 48, torch.float16, budget_ram)
 
         output_array = run_inference(input_tensor, self.args, self.device, self.transform)
         # print(output_array.shape)

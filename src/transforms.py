@@ -263,6 +263,19 @@ class Transforms():
                     # SaveImageD(keys="pred", output_dir="output", output_postfix="seg", resample=False, separate_folder=False),
                 ]
             )
+        
+        self.pred_transform = Compose(
+            [
+                InvertD(
+                    keys='pred',
+                    transform= self.inference_preprocessing,
+                    orig_keys="image",
+                    nearest_interp=True,
+                    to_tensor=True
+                ),
+                # AsDiscreteD(keys="pred", threshold=0.5)
+            ]
+        )
         self.save_inference_output = SaveMultipleKeysD(keys=['mlt','pulp','dist'], output_dir="output", output_postfixes=['mlt','pulp','dist'], separate_folder=False)
         self.save_inference_output_pred = SaveImageD(keys='pred', output_dir="output", output_postfix='pred', separate_folder=False)
         # self.save_inference_output_mlt = SaveImageD(keys="pred", output_dir="output", output_postfix="mlt", resample=False, separate_folder=False)
