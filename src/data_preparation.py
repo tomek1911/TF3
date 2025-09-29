@@ -8,8 +8,11 @@ import torch.nn.functional as f
 from collections import defaultdict, Counter
 from tqdm import tqdm
 from torch.utils.data import SequentialSampler, RandomSampler, WeightedRandomSampler
-from src.sobel_filter import SobelFilter
-
+if __name__ == "__main__":
+    from sobel_filter import SobelFilter
+else:
+    from src.sobel_filter import SobelFilter
+    
 import numpy as np
 from scipy.ndimage import distance_transform_edt as edt_cpu
 try:
@@ -68,13 +71,27 @@ def split_train_val(args):
             train_files.extend(random.sample(remaining_files, min(args.debug_data_limit, len(remaining_files))))
         else:
             train_files.extend(remaining_files)
-        
+       
         #non-random choice
         # val_files.extend(files[:args.val_items])
         # if args.debug_data_limit != -1:
         #     train_files.extend(files[args.val_items:args.val_items+args.debug_data_limit])
         # else:
         #     train_files.extend(files[args.val_items:])
+    
+    #save as JSON for repoducibility
+    
+    file_dict = {
+        "train_files": train_files,
+        "val_files": val_files
+    }
+
+    # Full path to save file
+    save_path = os.path.join(args.data, "data_split.json")
+
+    # Save as JSON
+    with open(save_path, "w") as f:
+        json.dump(file_dict, f, indent=4)
         
     # Pair image and label files - remove '_0000.nii.gz' from image filenames to match label filenames
     def pair_files(file_list):
@@ -85,6 +102,7 @@ def split_train_val(args):
              }
             for f in file_list
         ]
+        
 
     return pair_files(train_files), pair_files(val_files), [os.path.join(os.path.join(args.data, "labelsTr", f.replace("_0000.nii.gz", ".nii.gz"))) for f in all_files]
 
@@ -120,6 +138,42 @@ def build_sampler(dataset, domain_labels, args, split="train"):
         raise ValueError(f"Unsupported sampler type: {args.sampler}")
     
 ### Distance and Direction Maps Generation Functions
+
+def save_direction_channels(dir_map, reference_volume, out_dir, base_name="direction"):
+    """
+    Save a 3-channel direction map as three separate NIfTI volumes.
+
+    Parameters
+    ----------
+    dir_map : np.ndarray
+        3D+channel array of shape (3, H, W, D)
+    reference_nifti_path : str
+        Path to a reference NIfTI file (for affine/header)
+    out_dir : str
+        Directory to save the channel files
+    base_name : str
+        Base filename prefix
+    """
+    # Ensure dir_map is float32
+    dir_map = dir_map.astype(np.float32)
+
+    # Load reference header and affine
+    hdr = reference_volume.header.copy()
+    affine = reference_volume.affine
+
+    # ensure channel first
+    if dir_map.shape[0] != 3:
+        raise ValueError("dir_map must have shape (3, H, W, D)")
+
+    # Save each channel separately
+    channel_names = ["x", "y", "z"]
+    for i, ch_name in enumerate(channel_names):
+        ch_data = dir_map[i, :, :, :]
+        out_path = os.path.join(out_dir, f"{base_name}_dir_{ch_name}.nii.gz")
+
+        # Create NIfTI image
+        img = nib.Nifti1Image(ch_data, affine, hdr)
+        nib.save(img, out_path)
  
 class WatershedDistanceMapGenerator:
     def __init__(self, device="cpu"):
@@ -227,7 +281,7 @@ class WatershedDistanceMapGenerator:
             distance_map = torch.from_numpy(distance_map)
         distance_map = distance_map.view(1, 1, *distance_map.shape)
         direction_map = self.sobel3d(distance_map)
-        direction_map = f.normalize(direction_map, p=2.0, dim=0, eps=1e-8)
+        direction_map = f.normalize(direction_map, p=2.0, dim=1, eps=1e-12) # L2 normalize, dim is channel axis to normalize each dir vector
         
         if self.device == "cuda":
             direction_map = direction_map.squeeze().cpu().numpy()
@@ -249,34 +303,45 @@ def generate_watershed_maps(input_data_list, output_dir, device='cuda'):
         dir_map = distance_map_gen.get_dir_map(dist_map)
         dir_map = np.moveaxis(dir_map, 0, -1) # make it channel last
         
-        # Save
-        file_name = item.split('/')[-1].replace('_primary.nii.gz', '.nii.gz')
-        nib.save(nib.Nifti1Image(dist_map, nib_vol.affine), os.path.join(output_dir, 'distance_maps', file_name))
-        nib.save(nib.Nifti1Image(dir_map, nib_vol.affine), os.path.join(output_dir, 'direction_maps', file_name))
-        
-        # DIST_DIR
-        dist_map_ch = dist_map[..., np.newaxis]           # shape (X, Y, Z, 1)
-        combined_maps = np.concatenate([dist_map_ch, dir_map], axis=-1)  # shape: (X, Y, Z, 4)
+        # Prepare header file
         # Use the header of the first image, but adjust dimensionality
+        #DIR
         hdr = nib_vol.header.copy()
         hdr.set_data_dtype(np.float32)
+        hdr.set_data_shape(dir_map.shape)
+        hdr['dim'][0] = 4                 # number of dimensions: H,W,D, 3 dir channels
+        hdr['dim'][1] = dir_map.shape[0]  # X
+        hdr['dim'][2] = dir_map.shape[1]  # Y
+        hdr['dim'][3] = dir_map.shape[2]  # Z
+        hdr['dim'][4] = dir_map.shape[3]  # channels (C)
+        hdr['intent_code'] = 1007         # NIFTI_INTENT_VECTOR
+        hdr['intent_name'] = b'Vector'
+        # Save
+        file_name = item.split('/')[-1].replace('_primary.nii.gz', '.nii.gz')
+        nib.save(nib.Nifti1Image(dist_map, nib_vol.affine), os.path.join(os.path.dirname(output_dir), 'distance_maps', file_name))
+        nib.save(nib.Nifti1Image(dir_map, affine=nib_vol.affine, header=hdr), os.path.join(os.path.dirname(output_dir), 'direction_maps', file_name))
+        
+        # DIST_DIR combined
+        dist_map_ch = dist_map[..., np.newaxis]           # shape (X, Y, Z, 1)
+        combined_maps = np.concatenate([dist_map_ch, dir_map], axis=-1)  # shape: (X, Y, Z, 4) - monai will solve ensure channel first for pytorch
+        
         hdr.set_data_shape(combined_maps.shape)
         hdr['dim'][0] = 4                       # number of dimensions
         hdr['dim'][1] = combined_maps.shape[0]  # X
         hdr['dim'][2] = combined_maps.shape[1]  # Y
         hdr['dim'][3] = combined_maps.shape[2]  # Z
         hdr['dim'][4] = combined_maps.shape[3]  # channels (C)
-        hdr['intent_code'] = 1007      # NIFTI_INTENT_VECTOR
+        hdr['intent_code'] = 1007               # NIFTI_INTENT_VECTOR
         hdr['intent_name'] = b'Vector'
         
         # Save
-        nib.save(nib.Nifti1Image(combined_maps, affine=nib_vol.affine, header=hdr), os.path.join(output_dir, 'distdir_maps', file_name))
+        nib.save(nib.Nifti1Image(combined_maps, affine=nib_vol.affine, header=hdr), os.path.join(os.path.dirname(output_dir), 'distdir_maps', file_name))
         
 if __name__ == "__main__":
     import nibabel as nib
     from tqdm import tqdm
     
-    label_paths = ['data/labelsTr/ToothFairy3F_001.nii.gz']  
+    label_paths = ['data/labelsRemapped/ToothFairy3F_001_primary.nii.gz']  # use labels - without pulp to generate distance map
     for label_path in tqdm(label_paths):
         # Load NIfTI
         nib_vol = nib.load(label_path)
@@ -289,8 +354,22 @@ if __name__ == "__main__":
         dist_map =  distance_map_gen.get_edt_map(label_volume)
         dir_map = distance_map_gen.get_dir_map(dist_map)
         
-        out_img = nib.Nifti1Image(dist_map, nib_vol.affine, nib_vol.header)
-        nib.save(out_img, f"data/deep_watershed_volumes/distance_maps/{label_path.split('/')[-1]}")
+        filename = label_path.split('/')[-1].replace('_primary.nii.gz', '.nii.gz')
+        out_img = nib.Nifti1Image(dist_map.astype(np.float32), nib_vol.affine, nib_vol.header)
+        nib.save(out_img, f"data/deep_watershed_maps/distance_maps/{filename}")
         
-        out_img = nib.Nifti1Image(dir_map, nib_vol.affine, nib_vol.header)
-        nib.save(out_img, f"data/deep_watershed_volumes/direction_maps/{label_path.split('/')[-1]}")
+        hdr = nib_vol.header.copy()
+        hdr['dim'][0] = 4                  # set number of dimensions - 3D + channels = 4D
+        hdr['dim'][4] = dir_map.shape[0]   # channels
+        # swap channels to preview as sequence
+        #dir_map = np.moveaxis(dir_map, 0, -1)  # shape becomes (H, W, D, C) - to make it a sequence NiiVue
+        # out_img = nib.Nifti1Image(dir_map.astype(np.float32), nib_vol.affine, hdr)
+        # nib.save(out_img, f"data/deep_watershed_maps/direction_maps/{filename}")
+       
+        #save channels separately - to debug
+        save_direction_channels(
+            dir_map,
+            reference_volume=nib_vol,
+            out_dir="data/deep_watershed_maps/direction_maps",
+            base_name=filename.replace(".nii.gz", "")
+        )

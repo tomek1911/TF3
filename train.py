@@ -408,7 +408,7 @@ def main():
     #MODEL
     #num classes = 10 anatomical classes + 32 tooth classes + 3 canal classes + 1 pulp
     model = DWNet(spatial_dims=3, in_channels=1, out_channels=args.out_channels, act=args.activation, norm=args.norm,
-                  bias=False, backbone_name=args.backbone_name, configuration=args.configuration)
+                  bias=False, backbone_name=args.backbone_name, configuration=args.configuration, is_validation=True)
     if args.parallel:
         model = nn.DataParallel(model)
         model = model.to(device)

@@ -23,7 +23,8 @@ class DWNet(nn.Module):
         bias: bool = False,
         backbone_name: str = 'resnet34',
         inference_mode : bool = False,
-        configuration: str = "UNET"
+        configuration: str = "UNET",
+        is_validation: bool = False #set true for init of model for training - will allow to perform validation during training loop; otherwise model when eval will operate in test mode
     ) -> None:
         super().__init__()
 
@@ -50,6 +51,7 @@ class DWNet(nn.Module):
         self.is_dist = 'DIST' in configuration
         self.is_dir = 'DIR' in configuration
         self.is_pulp = 'PULP' in configuration
+        self.is_validation = is_validation    
         
         #DECODER
         ch4, ch3, ch2 = 256, 128, 64 #skip_channels: 512, 256, 128, 64, 64 (resnet34)
@@ -110,10 +112,10 @@ class DWNet(nn.Module):
         seg_multiclass = self.multiclass_decoder(torch.cat([seg, features[-1]], dim=1))
         dist = self.dist_decoder(torch.cat([x, features[-1]], dim=1)) 
         pulp = self.pulp_decoder(torch.cat([x, features[-1]], dim=1))
-        if self.training:
+        if self.training or self.is_validation:
             direction = self.direction_decoder(torch.cat([x, features[-1]], dim=1))
             direction = f.normalize(direction, p=2.0, dim=1)
-            return seg_multiclass, dist, direction, pulp # IN VALDATION WIWLL BREAK - FIX IT
+            return seg_multiclass, dist, direction, pulp # IN VALDATION WILL BREAK - FIX IT
         return seg_multiclass, dist, pulp
         # if self.is_edt:
         #     edt = self.edt_decoder(torch.cat([x, features[-1]], dim=1))   

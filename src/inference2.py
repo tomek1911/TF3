@@ -8,6 +8,9 @@ from typing import Tuple, Optional
 import numpy as np
 import gc
 import SimpleITK as sitk
+import nibabel as nib
+from nibabel.orientations import aff2axcodes
+
 # from monai.inferers import sliding_window_inference
 from copy import copy
 from monai.data import DataLoader, decollate_batch
@@ -17,7 +20,7 @@ from monai.data.utils import compute_importance_map, BlendMode
 from monai.inferers.utils import compute_importance_map
 
 from deep_watershed import deep_watershed_with_voting, deep_watershed_with_voting_optimized
-from inference_utils import merge_pulp_into_teeth, merge_pulp_into_teeth_torch, remap_labels_torch, pred_to_challange_map
+from inference_utils import merge_pulp_into_teeth_torch, remap_labels_torch, pred_to_challange_map, save_nifti
 from transforms import Transforms
 from sliding_window import sliding_window_inference, _get_scan_interval, dense_patch_slices
 from model import DWNet
@@ -133,7 +136,6 @@ def memory_efficient_inference_with_overlap(
     model: nn.Module,
     input_tensor: torch.Tensor,
     patch_size: Tuple[int, int, int],
-    stride: Optional[Tuple[int, int, int]] = None,
     device: Optional[torch.device] = None,
     overlap: float = 0.25,
     blend_mode: str = "gaussian", # "gaussian" or "constant"
@@ -201,7 +203,7 @@ def memory_efficient_inference_with_overlap(
             dist_output[:, :, s[0], s[1], s[2]] += dist # GPU stored
             pulp_output[:, :, s[0], s[1], s[2]] += pulp # GPU stored
 
-    # Final prediction
+    # Final post-processing
     return (sum_probs / sum_weights.cpu().clamp(min=1e-6)).argmax(dim=1, keepdim=True).to(dtype=torch.uint8, device=device), \
             nn.Threshold(1e-3, 0)(dist_output / sum_weights.clamp(min=1e-6)).to(cast_dtype), \
             (pulp_output / sum_weights.clamp(min=1e-6) > 0.5).to(torch.uint8)
@@ -401,13 +403,13 @@ def inference_step(args, model, data_sample, transform, device):
         pred_with_pulp = merge_pulp_into_teeth_torch(pred_multiclass_gpu.squeeze(), pulp_segmentation.squeeze(), pulp_class=50).to(torch.int32)  # H,W,D
         remapped = remap_labels_torch(pred_with_pulp, pred_to_challange_map)
         
-        #sace results to disk
-        # data_sample['pulp'] = MetaTensor(pulp_segmentation)
-        # data_sample['dist'] = MetaTensor(dist_pred)
-        # data_sample['mlt'] = MetaTensor(remapped.unsqueeze(0).unsqueeze(0)) # HERE IS CHANGED INPUT
-        # inverted_prediction_mlt = [transform.post_inference_transform_no_dir(i) for i in decollate_batch(data_sample)] 
-        # # inverted_prediction = transform.post_inference_transform(data_sample) 
-        # transform.save_inference_output(inverted_prediction_mlt[0])
+        # save results to disk
+        data_sample['pulp'] = MetaTensor(pulp_segmentation)
+        data_sample['dist'] = MetaTensor(dist_pred)
+        data_sample['mlt'] = MetaTensor(remapped.unsqueeze(0).unsqueeze(0)) # HERE IS CHANGED INPUT
+        inverted_prediction_mlt = [transform.post_inference_transform_no_dir(i) for i in decollate_batch(data_sample)] 
+        # inverted_prediction = transform.post_inference_transform(data_sample) 
+        transform.save_inference_output(inverted_prediction_mlt[0])
         
         return remapped
 
@@ -429,35 +431,94 @@ def main():
 
     device = get_default_device()
     transform = Transforms(args, device=device)
-    # input_image = {"image" : "data/imagesTr/ToothFairy3P_381_0000.nii.gz"}
-    input_image = {"image" : "data/imagesTr/ToothFairy3F_001_0000.nii.gz"}
+    input_image = [
+        # {"image": "data/imagesTr/ToothFairy3F_001_0000.nii.gz"},
+        # {"image": "data/imagesTr/ToothFairy3F_005_0000.nii.gz"},
+        {"image": "data/imagesTr/ToothFairy3F_009_0000.nii.gz"}, #VAL
+        {"image": "data/imagesTr/ToothFairy3F_013_0000.nii.gz"}, #VAL
+        # {"image": "data/imagesTr/ToothFairy3F_010_0000.nii.gz"},
+        {"image": "data/imagesTr/ToothFairy3P_059_0000.nii.gz"}, #VAL
+        {"image": "data/imagesTr/ToothFairy3P_095_0000.nii.gz"}, #VAL
+        # {"image": "data/imagesTr/ToothFairy3P_381_0000.nii.gz"},
+        # {"image": "data/imagesTr/ToothFairy3P_386_0000.nii.gz"},
+        # {"image": "data/imagesTr/ToothFairy3P_391_0000.nii.gz"},
+        {"image": "data/imagesTr/ToothFairy3S_0001_0000.nii.gz"}, #VAL
+        {"image": "data/imagesTr/ToothFairy3S_0014_0000.nii.gz"}, #VAL
+        # {"image": "data/imagesTr/ToothFairy3S_0005_0000.nii.gz"},
+        # {"image": "data/imagesTr/ToothFairy3S_0010_0000.nii.gz"},
+        # {"image": "data/imagesTr/ToothFairy3S_0015_0000.nii.gz"},
+    ]
     
-    dataset = Dataset(data=[input_image], transform=transform.inference_preprocessing)
+    dataset = Dataset(data=input_image, transform=transform.inference_preprocessing)
     dataloader = DataLoader(dataset, batch_size=1, num_workers=0)
-    data_sample = next(iter(dataloader))
+    # data_sample = next(iter(dataloader))
     
-    max_voxels = 10*1024**3 // (48 * 2)
-    z_slab_max = max_voxels // (data_sample["image"].shape[-3] * data_sample["image"].shape[-2])
-    pz = args.patch_size[2]
-    if z_slab_max < pz:
-        print("pixdim should be lower, cannot fit in RAM single patch_size z layer")
-    
-    # data_sample = transform.inference_preprocessing(input_image)
-    model = DWNet(spatial_dims=3, in_channels=1, out_channels=args.out_channels, act=args.activation, norm=args.norm,
-                bias=False, backbone_name=args.backbone_name, configuration='DIST_PULP')
-    model.load_state_dict(torch.load('checkpoints/checkpoints/silent_pie_5061/model_epoch_380.pth',
-                                    map_location=device, weights_only=True)['model_state_dict'], strict=False)
-    model = model.to(device)
-    model.eval()
-    
-    # data_sample = {"image" : MetaTensor(torch.rand((1,1,768,768,348), dtype=torch.float16, device=device))}
-    #num classes = bg + 45 teeth + dist_map + pulp = 48 classes
-    result = inference_wrapper(args, inference_step, model, device, data_sample, transform,
-                               args.patch_size, 0.25, 48, torch.float16, 7*1024**3)
-    
-    # result = inference_step(args, model, data_sample, transform, device)
+    for data_sample in dataloader:
 
+        # max_voxels = 10*1024**3 // (48 * 2)
+        # z_slab_max = max_voxels // (data_sample["image"].shape[-3] * data_sample["image"].shape[-2])
+        # pz = args.patch_size[2]
+        # if z_slab_max < pz:
+        #     print("pixdim should be lower, cannot fit in RAM single patch_size z layer")
+        
+        # data_sample = transform.inference_preprocessing(input_image)
+        model = DWNet(spatial_dims=3, in_channels=1, out_channels=args.out_channels, act=args.activation, norm=args.norm,
+                    bias=False, backbone_name=args.backbone_name, configuration='DIST_PULP')
+        model.load_state_dict(torch.load('checkpoints/checkpoints/silent_pie_5061/model_epoch_380.pth',
+                                        map_location=device, weights_only=True)['model_state_dict'], strict=False)
+        model = model.to(device)
+        model.eval()
+        
+        with torch.no_grad(), torch.amp.autocast(enabled=True, dtype=torch.float16, device_type=device.type):
+            ## SLOW - MEMORY EFFICIENT
+            # output = memory_efficient_inference_with_overlap(args, model, data_sample["image"], args.patch_size, device=device, overlap=0.25, 
+            #                                                  blend_mode="gaussian", sigma_scale=0.125, cast_dtype=torch.float16)
+            #(multiclass_segmentation, dist_pred, pulp_segmentation) = output
+            
+            ## FAST - MEMORY HUNGRY
+            output = sliding_window_inference(data_sample["image"], roi_size=args.patch_size, sw_batch_size=1, predictor=model, 
+                                            overlap=0.25, sw_device=device, device=device, mode='gaussian', sigma_scale=0.125,
+                                            padding_mode='constant', cval=0, progress=False)
+            (multiclass_segmentation, dist_pred, pulp_segmentation) = output
+            #preds
+            multiclass_segmentation = multiclass_segmentation.argmax(dim=1, keepdim=True).to(dtype=torch.uint8, device=device)
+            dist_pred = nn.Threshold(1e-3, 0)(torch.sigmoid(dist_pred)).to(torch.float16)
+            pulp_segmentation = (torch.sigmoid(pulp_segmentation) > 0.5).to(torch.uint8)
+            
+            binary_mask = torch.where(multiclass_segmentation >= 1, 1, 0).to(torch.uint8) # values: 0-1
+            markers = torch.where(dist_pred > 0.5, 1, 0).to(torch.uint8) # values: 0-1
+        
+        dist_pred_cpu = dist_pred.squeeze().cpu()
+        multiclass_segmentation_cpu = multiclass_segmentation.squeeze().cpu()
+        binary_mask_cpu =  binary_mask.squeeze().cpu()
+        markers_cpu = markers.squeeze().cpu()
+        
+        pred_multiclass = deep_watershed_with_voting_optimized(dist_pred_cpu.numpy(), 
+                                                            multiclass_segmentation_cpu.numpy(), 
+                                                            binary_mask_cpu.numpy(),
+                                                            markers_cpu.numpy())
+        with torch.no_grad():
+            pred_multiclass_gpu = torch.from_numpy(pred_multiclass).long().to(device)
+            pred_multiclass_gpu_clone = pred_multiclass_gpu.clone()
+            pred_with_pulp = merge_pulp_into_teeth_torch(pred_multiclass_gpu.squeeze(), pulp_segmentation.squeeze(), pulp_class=50).to(torch.int32) 
+            remapped = remap_labels_torch(pred_with_pulp, pred_to_challange_map)
+            ### invert transforms, eg. padding
+            # prediction = transform.post_inference_transform({"pred": MetaTensor(remapped.unsqueeze(0)), "image": data_sample["image"][0]})["pred"] # B,H,W,D
 
+        #SAVE RESULTS TO DISK TO PREVIEW
+        data_sample['pulp'] = MetaTensor(pulp_segmentation)
+        data_sample['dist'] = MetaTensor(dist_pred)
+        data_sample['mlt'] = MetaTensor(pred_multiclass_gpu_clone.unsqueeze(0).unsqueeze(0))
+        data_sample['final'] = MetaTensor(remapped.unsqueeze(0).unsqueeze(0))
+        
+        inverted_prediction_mlt = [transform.post_inference_transform_no_dir(i) for i in decollate_batch(data_sample)] 
+        transform.save_inference_output(inverted_prediction_mlt[0])
+        
+        #manual save - direct, no inversion, debug inversion
+        # save_nifti(pred_multiclass_gpu_clone, path='output', filename="manual_mlt.nii.gz", pixdim=0.2, dtype=np.uint8)
+        # save_nifti(remapped, path='output', filename="manual_final.nii.gz", pixdim=0.2, dtype=np.uint8)
+        # save_nifti(dist_pred, path='output', filename="manual_dist.nii.gz", pixdim=0.2, dtype=np.float32)
+        
 def sitk_to_monai(image: sitk.Image):
     """
     Convert a SimpleITK image to a numpy array + MONAI-style meta dict.
@@ -483,9 +544,6 @@ def sitk_to_monai(image: sitk.Image):
 
     return array, meta
 
-import nibabel as nib
-from nibabel.orientations import aff2axcodes
-
 def inspect_nifti(path: str):
     # Load NIfTI
     img = nib.load(path)
@@ -502,10 +560,6 @@ def inspect_nifti(path: str):
     return affine, orientation
 
 if __name__ ==  "__main__":
-    # from monai.transforms import LoadImage
-    # image = LoadImage(reader='NibabelReader')('data/imagesTr/ToothFairy3P_077_0000.nii.gz')
-    # affine, orientation = inspect_nifti("data/imagesTr/ToothFairy3P_077_0000.nii.gz")
-
     start_time_epoch = time.time()
     main()
     inference_time=time.time() - start_time_epoch
