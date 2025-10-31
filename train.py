@@ -62,11 +62,6 @@ from torch.utils.data import SubsetRandomSampler, WeightedRandomSampler
 from torch.nn import MSELoss
 
 #MONAI modules
-# from monai.losses import DiceLoss
-# from monai.metrics import MSEMetric
-# from monai.metrics import HausdorffDistanceMetric, SurfaceDistanceMetric, DiceMetric
-# from monai.metrics import CumulativeAverage
-# from monai.optimizers import WarmupCosineSchedule
 from monai.data import ThreadDataLoader, DataLoader, decollate_batch
 from monai.data.dataset import PersistentDataset, Dataset
 from monai.transforms import AsDiscrete
@@ -82,8 +77,6 @@ from src.model import DWNet
 from src.scheduler import CosineAnnealingWarmupRestarts, WarmupCosineSchedule
 from src.losses import DiceCELoss, DiceFocalLoss, AngularLoss, FocalDiceBCELoss, DiceBCELoss
 from src.transforms import Transforms, SaveMultipleKeysD
-# from src.deep_watershed import deep_watershed_with_voting
-# from src.inference_utils import save_float_map, save_inference_multiclass_segmentation, merge_pulp_into_teeth
 from src.metrics_helper import MetricsHelper    
 from src.log_helper import LogHelper
 
@@ -423,6 +416,7 @@ def main():
         if args.weighting_mode == 'inverse_frequency_class_weights':
             invfreq_weights = np.load("data/class_invfreq_weights.npy", allow_pickle=True)
             weights = torch.tensor(invfreq_weights, dtype=torch.float32, device=device)
+            weights[43:46]=args.nerve_canal_weight #high weight for small nerve canals
         else:
             raise NotImplementedError(f"Weighting mode {args.weighting_mode} not implemented.")
         
@@ -445,7 +439,7 @@ def main():
     elif args.optimizer == "Adam":
         optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, amsgrad=args.adam_ams, eps=args.adam_eps)
     elif args.optimizer == "AdamW":
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, eps=args.adam_eps)
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.9), weight_decay=args.weight_decay, eps=args.adam_eps)
     else:
         raise NotImplementedError(f"There are no implementation of: {args.optimizer}")
 
@@ -484,11 +478,7 @@ def main():
         for train_data in tqdm(pre_cache_loader, desc=f"Cache persistent dataset", total=len(pre_cache_loader),
                                file=sys.stderr, position=1, leave=False, disable=disable_tqdm):
             # continue
-            labels = train_data["label"][:,0:1]
-            # analyse volume
-            # unique, counts = torch.unique(labels, return_counts=True)
-            # for u, c in zip(unique.tolist(), counts.tolist()):
-            #     class_counter[u] += c
+            labels = train_data["label"][:,0:1] #1st-channel is primary labels, no pulp 
             unique_classes = torch.unique(labels).tolist()
             for u in unique_classes:
                 class_counter[int(u)] += 1

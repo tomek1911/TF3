@@ -2,6 +2,7 @@ import warnings
 from typing import Callable, Optional, Sequence, Union
 
 import torch
+import math
 import torch.nn as nn
 from torch.nn.modules.loss import _Loss
 
@@ -311,34 +312,55 @@ class DiceFocalLoss(_Loss):
         return dice_loss, focal_loss 
     
 class AngularLoss(_Loss):
-    '''
-    angular loss
-    '''
+    """
+    Angular loss: squared angle between predicted and ground truth unit vectors.
+    Works for any spatial dimensions (H, W, D, ...).
+    """
 
-    def __init__(self,
-                 eps=1e-6,
-                 eps_angle=1e-7,
-                 reduction='mean'):
-        super(AngularLoss, self).__init__(reduction=reduction)
+    def __init__(self, eps=1e-6, eps_angle=1e-4, reduction='mean_batch'):
+        """
+        Args:
+            eps_angle: small epsilon to avoid acos domain errors
+            reduction: 'none' | 'sum' | 'mean' | 'mean_batch'
+        """
+        super().__init__(reduction=reduction)
         self.eps = eps
         self.eps_angle = eps_angle
-        self.reduction=reduction
+        assert reduction in ['none', 'sum', 'mean', 'mean_batch'], "Invalid reduction"
 
     def forward(self, pred, gt, mask):
-        # reshape according to the spatial dimention - to get n-dimensional unit vectors
-        gt_vector = gt.reshape(gt.shape[:2] + (-1,)) * (1-self.eps)
-        pred_vector = pred.reshape(gt.shape[:2] + (-1,)) * (1-self.eps)
-        binary_mask_vector = mask.reshape(mask.shape[:1] + (-1,))       
-        #clip cosinus to -1,1 for numerical stability
-        angle_errors = torch.acos(torch.clamp(torch.sum(gt_vector*pred_vector, dim=1, keepdim=False),-1+self.eps_angle,1-self.eps_angle))
-        loss = torch.sum(angle_errors*angle_errors*binary_mask_vector, dim=1)
+        """
+        pred: predicted direction vectors, shape (B, C, ...)
+        gt: ground truth direction vectors, shape (B, C, ...)
+        mask: binary mask, shape (B, 1, ...) or (B, ...)
+        """
+        B, C = pred.shape[:2]
 
-        if self.reduction == 'mean':
-            return torch.mean(loss)
+        # reshape to (B, C, N)
+        pred_vector = pred.reshape(B, C, -1)
+        gt_vector = (gt.reshape(B, C, -1))
+        mask_vector = mask.reshape(B, -1).float()
+
+        # dot product per voxel
+        cos_sim = torch.sum(pred_vector * gt_vector, dim=1)  # shape (B, N)
+        cos_sim = torch.clamp(cos_sim, -1 + self.eps_angle, 1 - self.eps_angle)
+
+        # angle error normalized to [0,1]
+        angle_errors = torch.acos(cos_sim) / math.pi
+        loss_per_voxel = angle_errors ** 2 * mask_vector  # (B, N)
+
+        # apply reduction
+        if self.reduction == 'none':
+            return loss_per_voxel
         elif self.reduction == 'sum':
-            return torch.sum(loss)
-        elif self.reduction == 'none':
-            return loss
+            return torch.sum(loss_per_voxel)
+        elif self.reduction == 'mean':
+            # mean over all valid voxels in batch
+            return torch.sum(loss_per_voxel) / (torch.sum(mask_vector) + self.eps)
+        elif self.reduction == 'mean_batch':
+            # mean per batch element, then mean across batch
+            per_batch = torch.sum(loss_per_voxel, dim=1) / (torch.sum(mask_vector, dim=1) + self.eps)
+            return torch.mean(per_batch)
 
 class FocalDiceBCELoss(nn.Module):
     """
@@ -391,3 +413,77 @@ class DiceBCELoss(nn.Module):
         bce = self.bce_loss(logits, target.float())
         dice_loss = self.dice_loss(logits, target)
         return self.alpha * bce + (1 - self.alpha) * dice_loss
+    
+#Angular loss tests
+
+def test_zero_loss():
+    """Test: Perfect alignment → loss ≈ 0"""
+    loss_fn = AngularLoss()
+    pred = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    gt = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    mask = torch.ones(1, 2)
+    loss = loss_fn(pred, gt, mask)
+    assert torch.isclose(loss, torch.tensor(0.0), atol=1e-6), f"Expected 0, got {loss.item()}"
+    print("test_zero_loss passed.")
+
+
+def test_opposite_vectors():
+    """Test: Opposite direction → maximum angular loss (~1.0 normalized)"""
+    loss_fn = AngularLoss()
+    pred = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    gt = torch.tensor([[[-1.0, 0.0], [0.0, -1.0]]])
+    mask = torch.ones(1, 2)
+    loss = loss_fn(pred, gt, mask)
+    expected = (1.0 ** 2)  # π/π = 1, squared = 1
+    assert abs(loss.item() - expected) < 1e-5, f"Expected ~1, got {loss.item()}"
+    print("test_opposite_vectors passed.")
+
+
+def test_half_angle():
+    """Test: 90° misalignment → θ = π/2 → normalized θ=0.5 → loss=0.25"""
+    loss_fn = AngularLoss()
+    pred = torch.tensor([[[1.0], [0.0]]])
+    gt   = torch.tensor([[[0.0], [1.0]]])  
+    mask = torch.ones(1, 1)
+    loss = loss_fn(pred, gt, mask)
+    expected = 0.25  # (π/2 / π)^2 = 0.25
+    assert abs(loss.item() - expected) < 1e-5, f"Expected ~0.25, got {loss.item()}"
+    print("test_half_angle passed.")
+
+
+def test_masking():
+    """Test: Mask excludes some pixels correctly"""
+    loss_fn = AngularLoss()
+    pred = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    gt = torch.tensor([[[0.0, 1.0], [0.0, 1.0]]])
+    mask = torch.tensor([[1.0, 0.0]])  # only first pixel counts
+    loss = loss_fn(pred, gt, mask)
+    expected = (0.5 ** 2)  # 90° on one valid pixel
+    assert abs(loss.item() - expected) < 1e-5, f"Expected ~0.25, got {loss.item()}"
+    print("test_masking passed.")
+
+
+def test_batch_mean():
+    """Test: batch averaging is consistent"""
+    loss_fn = AngularLoss()
+    pred = torch.tensor([
+        [[1.0, 0.0], [0.0, 1.0]],   # sample 1
+        [[1.0, 0.0], [0.0, 1.0]]    # sample 2
+    ])
+    gt = torch.tensor([
+        [[1.0, 0.0], [0.0, 1.0]],   # aligned
+        [[0.0, 1.0], [1.0, 0.0]]    # 90° misaligned
+    ])
+    mask = torch.ones(2, 2)
+    loss = loss_fn(pred, gt, mask)
+    expected = (0.0 + 0.25) / 2  # mean over 2 samples
+    assert abs(loss.item() - expected) < 1e-5, f"Expected {expected}, got {loss.item()}"
+    print("test_batch_mean passed.")
+    
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    test_zero_loss()
+    test_opposite_vectors()
+    test_half_angle()
+    test_masking()
+    test_batch_mean()

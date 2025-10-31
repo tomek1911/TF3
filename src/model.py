@@ -112,10 +112,11 @@ class DWNet(nn.Module):
         seg_multiclass = self.multiclass_decoder(torch.cat([seg, features[-1]], dim=1))
         dist = self.dist_decoder(torch.cat([x, features[-1]], dim=1)) 
         pulp = self.pulp_decoder(torch.cat([x, features[-1]], dim=1))
-        if self.training or self.is_validation:
+        if self.training or self.is_validation: # angular loss is only helper task
             direction = self.direction_decoder(torch.cat([x, features[-1]], dim=1))
-            direction = f.normalize(direction, p=2.0, dim=1)
-            return seg_multiclass, dist, direction, pulp # IN VALDATION WILL BREAK - FIX IT
+            # direction = torch.tanh(direction) # stabilize gradient fo huge logits 
+            direction = f.normalize(direction, p=2.0, dim=1) # every vector along the channel dimension has unit length, per voxel
+            return seg_multiclass, dist, direction, pulp
         return seg_multiclass, dist, pulp
         # if self.is_edt:
         #     edt = self.edt_decoder(torch.cat([x, features[-1]], dim=1))   

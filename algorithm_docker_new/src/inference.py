@@ -3,10 +3,11 @@ import gc
 import time
 import torch.nn as nn
 import numpy as np
-# from monai.inferers import sliding_window_inference
+from typing import Tuple, Optional
 from monai.data import decollate_batch
 from monai.data.meta_tensor import MetaTensor
 import torch.nn.functional as F
+from contextlib import nullcontext
 from typing import Tuple, Optional
 from monai.inferers.utils import compute_importance_map
 from .sliding_window import _get_scan_interval, dense_patch_slices

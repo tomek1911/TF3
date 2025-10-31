@@ -78,11 +78,11 @@ def deep_watershed_with_voting_optimized(
 
     # Prepare markers
     if markers is None:
-        markers = (deep_watershed_basins > seed_distance_threshold).astype(np.uint8)
+        markers = (deep_watershed_basins > seed_distance_threshold).astype(np.int8)
 
     # Prepare binary mask
     if binary_mask is None:
-        binary_mask = (multiclass_segmentation >= 1).astype(np.uint8)
+        binary_mask = (multiclass_segmentation >= 1).astype(np.int8)
 
     # Label seeds
     instances = label(markers, connectivity=3, return_num=False).astype(np.int16, copy=False)
@@ -91,7 +91,7 @@ def deep_watershed_with_voting_optimized(
     instance_masks = watershed(-deep_watershed_basins, instances, mask=binary_mask).astype(np.int16, copy=False)
 
     # Prepare output
-    output = np.zeros_like(instance_masks, dtype=np.uint8)
+    output = np.zeros_like(instance_masks, dtype=np.int8)
 
     # Get slices of all instances
     slices = find_objects(instance_masks)

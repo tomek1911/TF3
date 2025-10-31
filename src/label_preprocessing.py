@@ -147,7 +147,7 @@ def remap_labels(data):
 def remap_labels_fast(data):
     data = data.astype(np.int32, copy=False)
 
-    # Create mapping from ID → tooth ID (or itself if not pulp)
+    # Create mapping from ID → tooth ID (or itself if not pulp) - i.e. change pulp IDs to tooth IDs
     pulp_ids = np.array(list(PULP_IDS), dtype=np.int32)
     max_id = max(data.max(), pulp_ids.max())
     mapping = np.arange(max_id + 1, dtype=np.int32)
@@ -157,7 +157,7 @@ def remap_labels_fast(data):
     # Apply mapping to get primary labels
     primary = mapping[data]
 
-    # Create pulp mask in one shot
+    # Create pulp mask in one shot - all pulp IDs become 1, rest 0
     pulp_mask = np.isin(data, pulp_ids).astype(np.uint8)
     
     return primary, pulp_mask
@@ -196,4 +196,4 @@ for fname in tqdm(label_files, desc="Remapping labels"):
         img_multi = nib.Nifti1Image(multi_channel, affine=img.affine, header=hdr)
         nib.save(img_multi, os.path.join(OUTPUT_DIR, fname))
     
-print("✅ Remapping complete. Saved to", OUTPUT_DIR)
+print("Remapping complete. Saved to", OUTPUT_DIR)

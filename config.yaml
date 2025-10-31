@@ -56,7 +56,7 @@ args:
   images_folder: imagesTr
   labels_folder: labelsRemapped # Option: labelsTr 
   watershed_maps_folder: deep_watershed_maps/distdir_maps
-  cache_dir: data/cache
+  cache_dir: /mnt/vdb1/storage/tsz/data/tf3/cache
   experiment_dir: output/comet_nii_logs
   clear_cache: False
   create_preproc_cache: False
@@ -76,9 +76,9 @@ args:
   pixdim: 0.3
   houndsfield_clip: 3000
   patch_size: 
-    - 288
-    - 288
-    - 160
+    - 256
+    - 256
+    - 128
   crop_samples: 1
 
   # Geometric Augmentation
@@ -134,9 +134,10 @@ args:
   inference_autocast_dtype: float16
   loss_weights: #loss_weights
     multiclass_seg_loss: 0.1
-    dist_loss: 10
-    dir_loss: 1.0e-6
+    dist_loss: 10.0
+    dir_loss: 1.0
     pulp_loss: 1.0
+  nerve_canal_weight: 5.0
 
 # --------------------------------------------------
 # Scheduler Settings
@@ -153,7 +154,7 @@ args:
   seg_loss_name: DiceCELoss #Options 
   focal_gamma: 0.2
   focal_alpha: 0.5
-  bce_weight: 5
+  bce_weight: 10
   weighting_mode: inverse_frequency_class_weights #Options: none, inverse_frequency_class_weights
   include_background_loss: True
   include_background_metrics: False

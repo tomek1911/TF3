@@ -40,6 +40,7 @@ def free(tensor):
     if tensor is not None:
         tensor = None
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()
     return tensor
 
 def plan_z_slabs(D: int, slab: int):
@@ -210,7 +211,7 @@ def memory_efficient_inference_with_overlap(
             pulp_output[:, :, s[0], s[1], s[2]] += pulp # GPU stored
 
     # Final post-processing
-    return (sum_probs / sum_weights.cpu().clamp(min=1e-6)).argmax(dim=1, keepdim=True).to(dtype=torch.uint8, device=device), \
+    return (sum_probs / sum_weights.cpu().clamp(min=1e-6)).argmax(dim=1).to(dtype=torch.uint8, device=device), \
             nn.Threshold(1e-3, 0)(dist_output / sum_weights.clamp(min=1e-6)).to(cast_dtype), \
             (pulp_output / sum_weights.clamp(min=1e-6) > 0.5).to(torch.uint8)
 
@@ -315,8 +316,7 @@ def memory_efficient_inference_2(
     Sliding-window inference with overlap.
     Supports memory-efficient mode with vectorized class update.
     """
-    device = device or torch.device("cuda")
-    num_dims = len(input_tensor.shape)
+    device = device or input_tensor.device
     _, _, H, W, D = input_tensor.shape
 
     overlap = overlap if isinstance(overlap, (tuple, list)) else (overlap,) * len(patch_size)
@@ -327,85 +327,81 @@ def memory_efficient_inference_2(
     importance_map = compute_importance_map(
         patch_size, mode=blend_mode, sigma_scale=sigma_scale, device=device, dtype=cast_dtype
     )
-    importance_map = importance_map[None, None] # [1,1,ph,pw,pd]
+    importance_map = importance_map.unsqueeze(0).unsqueeze(0) # [1,1,ph,pw,pd]
 
-    # CUDA stream
-    stream = torch.cuda.Stream(device=device) if use_cuda_stream else None
-    stream_context = torch.cuda.stream(stream) if stream else nullcontext()
+    if memory_efficient:
+        # CUDA stream
+        stream = torch.cuda.Stream(device=device) if use_cuda_stream else None
+        stream_context = torch.cuda.stream(stream) if stream else nullcontext()
+    
+        # --- Vectorized memory-efficient mode ---
+        best_class = torch.zeros((1, 1, H, W, D), dtype=torch.uint8, device="cpu", pin_memory=True)
+        best_score = torch.zeros((1, 1, H, W, D), dtype=torch.float32, device="cpu", pin_memory=True)
+        sum_weights = torch.zeros((1, 1, H, W, D), dtype=torch.float32, device="cpu", pin_memory=True)
 
-    model.eval()
-    with torch.no_grad():
+        for s in slices:
+            with stream_context:
+                patch = input_tensor[:, :, s[0], s[1], s[2]].to(device, non_blocking=True)
+                logits, dist, pulp = model(patch)
 
-        if memory_efficient:
-            # --- Vectorized memory-efficient mode ---
-            best_class = torch.zeros((1, 1, H, W, D), dtype=torch.uint8, device="cpu", pin_memory=True)
-            best_score = torch.zeros((1, 1, H, W, D), dtype=torch.float32, device="cpu", pin_memory=True)
-            sum_weights = torch.zeros((1, 1, H, W, D), dtype=torch.float32, device="cpu", pin_memory=True)
+                probs_patch = torch.softmax(logits, dim=1).to(torch.float32)
+                w_patch = importance_map[:, :, :probs_patch.shape[2],
+                                            :probs_patch.shape[3],
+                                            :probs_patch.shape[4]]
 
-            for s in slices:
-                with stream_context:
-                    patch = input_tensor[:, :, s[0], s[1], s[2]].to(device, non_blocking=True)
-                    logits, dist, pulp = model(patch)
+            if stream:
+                torch.cuda.current_stream().wait_stream(stream)
 
-                    probs_patch = torch.softmax(logits, dim=1).to(torch.float32)
-                    w_patch = importance_map[:, :, :probs_patch.shape[2],
-                                             :probs_patch.shape[3],
-                                             :probs_patch.shape[4]]
+            # Move to CPU
+            probs_patch = probs_patch.cpu()
+            w_patch = w_patch.cpu()
 
-                if stream:
-                    torch.cuda.current_stream().wait_stream(stream)
+            # Weighted probabilities
+            weighted_probs = probs_patch * w_patch  # [1,C,ph,pw,pd]
 
-                # Move to CPU
-                probs_patch = probs_patch.cpu()
-                w_patch = w_patch.cpu()
+            # Vectorized argmax along class dimension
+            local_max_score, local_class = weighted_probs.max(dim=1, keepdim=True)  # [1,1,ph,pw,pd]
 
-                # Weighted probabilities
-                weighted_probs = probs_patch * w_patch  # [1,C,ph,pw,pd]
+            # Global slice
+            gs = (s[0], s[1], s[2])
 
-                # Vectorized argmax along class dimension
-                local_max_score, local_class = weighted_probs.max(dim=1, keepdim=True)  # [1,1,ph,pw,pd]
+            # Update sum_weights
+            sum_weights[:, :, gs[0], gs[1], gs[2]] += w_patch
 
-                # Global slice
-                gs = (s[0], s[1], s[2])
+            # Update global best_score and best_class
+            existing_best = best_score[:, :, gs[0], gs[1], gs[2]]
+            mask = local_max_score > existing_best
+            best_score[:, :, gs[0], gs[1], gs[2]][mask] = local_max_score[mask]
+            best_class[:, :, gs[0], gs[1], gs[2]][mask] = local_class[mask]
 
-                # Update sum_weights
-                sum_weights[:, :, gs[0], gs[1], gs[2]] += w_patch
+        multiclass_output = best_class
+        dist_output = None
+        pulp_output = None
 
-                # Update global best_score and best_class
-                existing_best = best_score[:, :, gs[0], gs[1], gs[2]]
-                mask = local_max_score > existing_best
-                best_score[:, :, gs[0], gs[1], gs[2]][mask] = local_max_score[mask]
-                best_class[:, :, gs[0], gs[1], gs[2]][mask] = local_class[mask]
+    else:
+        #CPU accumulator
+        multiclass_probs = torch.zeros((1, args.out_channels, H, W, D), dtype=cast_dtype, device="cpu", pin_memory=True)
+        #GPU accumulator
+        weights_accumulator = torch.zeros((1, 1, H, W, D), dtype=cast_dtype, device=device)
+        dist_probs = torch.zeros((1, 1, H, W, D), dtype=cast_dtype, device=device)
+        pulp_probs = torch.zeros((1, 1, H, W, D), dtype=cast_dtype, device=device)
 
-            multiclass_output = best_class
-            dist_output = None
-            pulp_output = None
+        for s in slices:
+            patch = input_tensor[:, :, s[0], s[1], s[2]]
+            logits, dist_patch, pulp_patch = model(patch)
+  
+            weighted_probs = torch.softmax(logits, dim=1).to(cast_dtype) * importance_map              
+            cpu_probs = weighted_probs.to('cpu', dtype=cast_dtype, non_blocking=True) #begin transfer
+            weighted_dist = torch.sigmoid(dist_patch).to(cast_dtype) * importance_map
+            weighted_pulp = torch.sigmoid(pulp_patch).to(cast_dtype) * importance_map
+            
+            weights_accumulator[:, :, s[0], s[1], s[2]] += importance_map
+            dist_probs[:, :, s[0], s[1], s[2]] += weighted_dist
+            pulp_probs[:, :, s[0], s[1], s[2]] += weighted_pulp
+            torch.cuda.synchronize() # ensure GPU->CPU transfer is done
+            multiclass_probs[:, :, s[0], s[1], s[2]] += cpu_probs
 
-        else:
-            #CPU accumulator
-            multiclass_probs = torch.empty((1, args.out_channels, H, W, D), dtype=cast_dtype, device="cpu", pin_memory=True)
-            #GPU accumulator
-            weights_accumulator = torch.empty((1, 1, H, W, D), dtype=cast_dtype, device=device)
-            dist_probs = torch.empty((1, 1, H, W, D), dtype=cast_dtype, device=device)
-            pulp_probs = torch.empty((1, 1, H, W, D), dtype=cast_dtype, device=device)
-
-            for s in slices:
-                logits, dist_patch, pulp_patch = model(input_tensor[:, :, s[0], s[1], s[2]])
-                probs_patch = torch.softmax(logits, dim=1).to(cast_dtype)
-                w_patch = importance_map[:, :, :probs_patch.shape[2], :probs_patch.shape[3], :probs_patch.shape[4]]
-                
-                weighted_probs = probs_patch * w_patch              
-                weighted_dist = torch.sigmoid(dist_patch) * w_patch
-                weighted_pulp = torch.sigmoid(pulp_patch) * w_patch
-                
-                cpu_probs = weighted_probs.to('cpu', dtype=cast_dtype, non_blocking=True)
-        
-                weights_accumulator[:, :, s[0], s[1], s[2]] += w_patch.half()
-                dist_probs[:, :, s[0], s[1], s[2]] += weighted_dist.half()
-                pulp_probs[:, :, s[0], s[1], s[2]] += weighted_pulp.half()
-                multiclass_probs[:, :, s[0], s[1], s[2]] += cpu_probs
-
-    return multiclass_probs, dist_probs, pulp_probs, weights_accumulator.clamp(min=1e-6)
+    return multiclass_probs, dist_probs, pulp_probs, weights_accumulator
 
 def split_infer_merge(
     image: torch.Tensor,
@@ -530,7 +526,8 @@ def inference_step(args, model, data_sample, transform, device):
 
 def main():
 
-    is_ram_efficient_inference = False
+    is_ram_efficient_inference = True
+    is_new_inference = False
 
     config_file = 'config.yaml'
     with open(config_file, 'r') as file:
@@ -591,25 +588,36 @@ def main():
                 model.eval()
                 
                 if is_ram_efficient_inference:
-                    multiclass_probs, dist_probs, pulp_probs, weights_accumulator = \
-                        memory_efficient_inference_2(args, model, data_sample["image"], args.patch_size, device=device, overlap=0.25, blend_mode="gaussian",
-                                                              sigma_scale=0.125, cast_dtype=torch.float16, use_cuda_stream=True, memory_efficient=False)
-                    model = free(model)
-                    multiclass_probs = multiclass_probs.to(device)
-                    multiclass_pred = (multiclass_probs / weights_accumulator).argmax(dim=1, keepdim=False).squeeze().to(device='cpu', dtype=torch.int8)
-                    multiclass_probs = free(multiclass_probs)
-                    
-                    binary_mask = torch.where(multiclass_pred >= 1, 1, 0).to(torch.int8).squeeze().cpu()
-                    dist_pred =  nn.Threshold(1e-3, 0)(dist_probs / weights_accumulator).squeeze().cpu()
-                    dist_probs = free(dist_probs)
-                    
-                    markers = torch.where(dist_pred > 0.5, 1, 0).to(torch.int8).squeeze().cpu()
-                    pulp_pred = (pulp_probs / weights_accumulator > 0.5).to(torch.uint8).squeeze()
-                    pulp_probs = free(pulp_probs)
-
+                    if is_new_inference:
+                        multiclass_probs, dist_probs, pulp_probs, weights_accumulator = \
+                            memory_efficient_inference_2(args, model, data_sample["image"], args.patch_size, device=device, overlap=0.25, blend_mode="gaussian",
+                                                        sigma_scale=0.125, cast_dtype=torch.float16, use_cuda_stream=False, memory_efficient=False)
+                        model = free(model)
+                        multiclass_probs = multiclass_probs.to(device)
+                        # multiclass_pred = (multiclass_probs / weights_accumulator.cpu()).argmax(dim=1).squeeze().to(device=device, dtype=torch.uint8) 
+                        multiclass_pred = (multiclass_probs / weights_accumulator).argmax(dim=1).squeeze().to(device='cpu', dtype=torch.uint8) #min weights_acc is 1e-3 - min of gaussian map
+                        multiclass_probs = free(multiclass_probs)
+                        
+                        binary_mask = torch.where(multiclass_pred >= 1, 1, 0).to(torch.int8).squeeze().cpu()
+                        dist_pred =  nn.Threshold(1e-3, 0)(dist_probs / weights_accumulator).squeeze().cpu()
+                        dist_probs = free(dist_probs)
+                        
+                        markers = torch.where(dist_pred > 0.5, 1, 0).to(torch.int8).squeeze().cpu()
+                        pulp_segmentation = (pulp_probs / weights_accumulator > 0.5).to(torch.uint8).squeeze()
+                        pulp_probs = free(pulp_probs)
+                    else:
+                        multiclass_segmentation, dist_pred, pulp_segmentation = \
+                            memory_efficient_inference_with_overlap(args, model, data_sample["image"], args.patch_size, device=device, overlap=0.25,
+                                                                    blend_mode="gaussian", sigma_scale=0.125, cast_dtype=torch.float16)
+                        markers = torch.where(dist_pred > 0.5, 1, 0).to(torch.int8).squeeze().cpu()
+                        dist_pred = dist_pred.squeeze().cpu()
+                        pulp_segmentation = pulp_segmentation.squeeze()
+                        binary_mask = torch.where(multiclass_segmentation >= 1, 1, 0).to(torch.int8).squeeze().cpu()
+                        multiclass_pred = multiclass_segmentation.squeeze().cpu()
                 else:
-                    (multiclass_segmentation, dist_pred, pulp_segmentation) = sliding_window_inference(data_sample["image"], roi_size=args.patch_size, sw_batch_size=1, predictor=model, 
-                                                    overlap=0.25, sw_device=device, device=device, mode='gaussian', sigma_scale=0.125,padding_mode='constant', cval=0, progress=False)
+                    (multiclass_segmentation, dist_pred, pulp_segmentation) =  \
+                        sliding_window_inference(data_sample["image"], roi_size=args.patch_size, sw_batch_size=1, predictor=model,
+                                                 overlap=0.25, sw_device=device, device=device, mode='gaussian', sigma_scale=0.125, padding_mode='constant', cval=0, progress=False)
                     multiclass_pred = multiclass_segmentation.argmax(dim=1, keepdim=True).squeeze().cpu()
                     dist_pred = nn.Threshold(1e-3, 0)(torch.sigmoid(dist_pred)).to(torch.float16).squeeze().cpu()
                     pulp_segmentation = (torch.sigmoid(pulp_segmentation) > 0.5).to(torch.int8).squeeze()
@@ -620,9 +628,12 @@ def main():
                                                                multiclass_pred.numpy(), 
                                                                binary_mask.numpy(),
                                                                markers.numpy())
+        
+        print(np.unique(pred_multiclass))
+        
         with torch.no_grad():
             pred_multiclass_gpu = torch.from_numpy(pred_multiclass).to(dtype=torch.long, device=device, non_blocking=True)
-            pred_with_pulp = merge_pulp_into_teeth_torch(pred_multiclass_gpu, pulp_pred, pulp_class=50).to(torch.int32) 
+            pred_with_pulp = merge_pulp_into_teeth_torch(pred_multiclass_gpu, pulp_segmentation, pulp_class=50).to(torch.int32) 
             remapped = remap_labels_torch(pred_with_pulp, pred_to_challange_map)
             ### invert transforms, eg. padding
             # prediction = transform.post_inference_transform({"pred": MetaTensor(remapped.unsqueeze(0)), "image": data_sample["image"][0]})["pred"] # B,H,W,D
