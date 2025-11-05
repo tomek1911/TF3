@@ -76,9 +76,9 @@ args:
   pixdim: 0.3
   houndsfield_clip: 3000
   patch_size: 
-    - 256
-    - 256
-    - 128
+    - 288   
+    - 288
+    - 160
   crop_samples: 1
 
   # Geometric Augmentation
@@ -86,11 +86,11 @@ args:
   rotation_range_xy: 0.1       # max rotation in radians (~5-6 degrees)
   rotation_range_z: 0.15 
   rotation_prob: 0.75        # probability to apply rotation
-  scale_range: 0.05           # skip scaling to avoid interpolation artifacts
+  scale_range: 0.05          # skip scaling to avoid interpolation artifacts
   use_anisotropic: True
-  min_zoom: 0.95
-  max_zoom: 1.05
-  zoom_prob: 0.5
+  min_zoom: 0.9
+  max_zoom: 1.1
+  zoom_prob: 0.25
 
   # Intensity Augmentation
   intensity_scale: 0.1
@@ -153,8 +153,8 @@ args:
 # --------------------------------------------------
   seg_loss_name: DiceCELoss #Options 
   focal_gamma: 0.2
-  focal_alpha: 0.5
-  bce_weight: 10
+  focal_alpha: 0.3
+  bce_weight: 1.0e2
   weighting_mode: inverse_frequency_class_weights #Options: none, inverse_frequency_class_weights
   include_background_loss: True
   include_background_metrics: False

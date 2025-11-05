@@ -2,6 +2,7 @@ import torch
 import time
 import argparse
 import yaml
+import math
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional
@@ -21,7 +22,7 @@ from monai.inferers.utils import compute_importance_map
 
 from deep_watershed import deep_watershed_with_voting, deep_watershed_with_voting_optimized
 from inference_utils import merge_pulp_into_teeth_torch, remap_labels_torch, pred_to_challange_map, save_nifti
-from transforms import Transforms
+from transforms import Transforms, SaveMultipleKeysD
 from sliding_window import sliding_window_inference, _get_scan_interval, dense_patch_slices
 from model import DWNet
 from monai.transforms import SpatialCropD
@@ -147,7 +148,7 @@ def memory_efficient_inference_with_overlap(
     overlap: float = 0.25,
     blend_mode: str = "gaussian", # "gaussian" or "constant"
     sigma_scale: float = 0.125,
-    cast_dtype = torch.float16
+    cast_dtype = torch.float16,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Sliding-window inference with overlap + importance map (constant/gaussian).
@@ -309,7 +310,7 @@ def memory_efficient_inference_2(
     blend_mode: str = "gaussian",
     sigma_scale: float = 0.125,
     cast_dtype: torch.dtype = torch.float16,
-    use_cuda_stream: bool = False,
+    dist_map_cast_dtype = torch.float32,
     memory_efficient: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
@@ -326,32 +327,23 @@ def memory_efficient_inference_2(
     # Importance map
     importance_map = compute_importance_map(
         patch_size, mode=blend_mode, sigma_scale=sigma_scale, device=device, dtype=cast_dtype
-    )
-    importance_map = importance_map.unsqueeze(0).unsqueeze(0) # [1,1,ph,pw,pd]
+    )[None, None] # [1,1,ph,pw,pd]
 
     if memory_efficient:
-        # CUDA stream
-        stream = torch.cuda.Stream(device=device) if use_cuda_stream else None
-        stream_context = torch.cuda.stream(stream) if stream else nullcontext()
-    
         # --- Vectorized memory-efficient mode ---
         best_class = torch.zeros((1, 1, H, W, D), dtype=torch.uint8, device="cpu", pin_memory=True)
         best_score = torch.zeros((1, 1, H, W, D), dtype=torch.float32, device="cpu", pin_memory=True)
         sum_weights = torch.zeros((1, 1, H, W, D), dtype=torch.float32, device="cpu", pin_memory=True)
 
         for s in slices:
-            with stream_context:
-                patch = input_tensor[:, :, s[0], s[1], s[2]].to(device, non_blocking=True)
-                logits, dist, pulp = model(patch)
 
-                probs_patch = torch.softmax(logits, dim=1).to(torch.float32)
-                w_patch = importance_map[:, :, :probs_patch.shape[2],
-                                            :probs_patch.shape[3],
-                                            :probs_patch.shape[4]]
+            patch = input_tensor[:, :, s[0], s[1], s[2]].to(device, non_blocking=True)
+            logits, dist, pulp = model(patch)
 
-            if stream:
-                torch.cuda.current_stream().wait_stream(stream)
-
+            probs_patch = torch.softmax(logits, dim=1).to(torch.float32)
+            w_patch = importance_map[:, :, :probs_patch.shape[2],
+                                        :probs_patch.shape[3],
+                                        :probs_patch.shape[4]]
             # Move to CPU
             probs_patch = probs_patch.cpu()
             w_patch = w_patch.cpu()
@@ -380,28 +372,348 @@ def memory_efficient_inference_2(
 
     else:
         #CPU accumulator
-        multiclass_probs = torch.zeros((1, args.out_channels, H, W, D), dtype=cast_dtype, device="cpu", pin_memory=True)
+        multiclass_probs = torch.zeros((1, args.out_channels, H, W, D), dtype=cast_dtype, device="cpu")
         #GPU accumulator
         weights_accumulator = torch.zeros((1, 1, H, W, D), dtype=cast_dtype, device=device)
-        dist_probs = torch.zeros((1, 1, H, W, D), dtype=cast_dtype, device=device)
+        dist_probs = torch.zeros((1, 1, H, W, D), dtype=dist_map_cast_dtype, device=device)
         pulp_probs = torch.zeros((1, 1, H, W, D), dtype=cast_dtype, device=device)
-
+        
         for s in slices:
             patch = input_tensor[:, :, s[0], s[1], s[2]]
             logits, dist_patch, pulp_patch = model(patch)
-  
-            weighted_probs = torch.softmax(logits, dim=1).to(cast_dtype) * importance_map              
-            cpu_probs = weighted_probs.to('cpu', dtype=cast_dtype, non_blocking=True) #begin transfer
-            weighted_dist = torch.sigmoid(dist_patch).to(cast_dtype) * importance_map
-            weighted_pulp = torch.sigmoid(pulp_patch).to(cast_dtype) * importance_map
+            
+            #clamp logits to avoid oversaturation in float16
+            weighted_probs = torch.softmax(logits.clamp(-15,15), dim=1).to(cast_dtype) * importance_map              
+            weighted_dist = torch.sigmoid(dist_patch.clamp(-8,8)).to(dist_map_cast_dtype) * importance_map
+            weighted_pulp = torch.sigmoid(pulp_patch.clamp(-8,8)).to(cast_dtype) * importance_map
             
             weights_accumulator[:, :, s[0], s[1], s[2]] += importance_map
             dist_probs[:, :, s[0], s[1], s[2]] += weighted_dist
             pulp_probs[:, :, s[0], s[1], s[2]] += weighted_pulp
             torch.cuda.synchronize() # ensure GPU->CPU transfer is done
-            multiclass_probs[:, :, s[0], s[1], s[2]] += cpu_probs
+            multiclass_probs[:, :, s[0], s[1], s[2]] += weighted_probs.to('cpu', dtype=cast_dtype)
 
     return multiclass_probs, dist_probs, pulp_probs, weights_accumulator
+
+def memory_efficient_inference_3(
+    args,
+    model: torch.nn.Module,
+    input_tensor: torch.Tensor,
+    patch_size: Tuple[int, int, int],
+    device: Optional[torch.device] = None,
+    overlap: float = 0.25,
+    blend_mode: str = "gaussian",
+    sigma_scale: float = 0.125,
+    cast_dtype: torch.dtype = torch.float16,
+    dist_map_cast_dtype=torch.float32,
+    non_blocking: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Sliding-window inference with overlap and memory-efficient CPU accumulation.
+    Flushes non-overlapping slabs of predictions progressively to limit RAM usage.
+    Compatible with MONAI `_get_scan_interval` and `dense_patch_slices`.
+    """
+
+    device = device or input_tensor.device
+    _, _, H, W, D = input_tensor.shape
+
+    overlap = overlap if isinstance(overlap, (tuple, list)) else (overlap,) * len(patch_size)
+    scan_interval = _get_scan_interval((H, W, D), patch_size, len(patch_size), overlap)
+    slices = dense_patch_slices((H, W, D), patch_size, scan_interval)
+     # Sort slices by z_start
+    slices.sort(key=lambda s: (s[2].start, s[1].start, s[0].start))
+
+    # Gaussian importance map for weighting
+    importance_map = compute_importance_map(
+        patch_size, mode=blend_mode, sigma_scale=sigma_scale, device=device, dtype=cast_dtype
+    )[None, None]  # shape (1,1,ph,pw,pd)
+
+     # Final output segmentation (uint8)
+    pred_seg = torch.zeros((1, 1, H, W, D), dtype=torch.uint8, device="cpu")
+    
+    # Accumulators (1-channel)
+    weights_accumulator = torch.zeros((1, 1, H, W, D), dtype=cast_dtype, device=device)
+    dist_probs = torch.zeros((1, 1, H, W, D), dtype=dist_map_cast_dtype, device=device)
+    pulp_probs = torch.zeros((1, 1, H, W, D), dtype=cast_dtype, device=device)
+    
+    # Temporary slab for class probabilities
+    slab_probs = torch.zeros((1, args.out_channels, H, W, patch_size[2]), dtype=cast_dtype, device="cpu")
+
+    # Flush helpers
+    nx = math.ceil((H - patch_size[0]) / scan_interval[0]) + 1
+    ny = math.ceil((W - patch_size[1]) / scan_interval[1]) + 1
+    patches_per_z = nx * ny
+    last_flushed_z = 0
+
+    with torch.inference_mode():
+        for idx, s in enumerate(slices):
+            z0, z1 = s[2].start, s[2].stop
+
+            # Extract patch and run inference
+            patch = input_tensor[:, :, s[0], s[1], s[2]].to(device, non_blocking=non_blocking)
+            logits, dist_patch, pulp_patch = model(patch)
+
+            # Compute weighted probabilities on GPU
+            weighted_probs = torch.softmax(logits.clamp(-15, 15), dim=1).to(cast_dtype) * importance_map
+            weighted_dist = torch.sigmoid(dist_patch.clamp(-8, 8)).to(dist_map_cast_dtype) * importance_map
+            weighted_pulp = torch.sigmoid(pulp_patch.clamp(-8, 8)).to(cast_dtype) * importance_map
+
+            torch.cuda.synchronize()
+            weighted_probs_cpu = weighted_probs.to("cpu", non_blocking=non_blocking)
+           
+            slab_probs[:, :, s[0], s[1], :] += weighted_probs_cpu
+            weights_accumulator[:, :, s[0], s[1], s[2]] += importance_map
+            dist_probs[:, :, s[0], s[1], s[2]] += weighted_dist
+            pulp_probs[:, :, s[0], s[1], s[2]] += weighted_pulp
+
+            del patch, logits, weighted_probs, weighted_dist, weighted_pulp, weighted_probs_cpu
+            torch.cuda.empty_cache()
+            
+            # Flush once we complete all XY patches for a z block
+            if (idx + 1) % patches_per_z == 0:
+                z_end = z1
+                flush_end = max(last_flushed_z, min(D, z_end - int(patch_size[2] * overlap[2])))
+                
+                slab = slab_probs[:, :, :, :, last_flushed_z:flush_end]
+                slab /= weights_accumulator[:, :, :, :, last_flushed_z:flush_end].cpu()
+                pred_seg[:, :, :, :, last_flushed_z:flush_end] = slab.argmax(dim=1)
+                last_flushed_z = flush_end
+                #transfer slab overlap to the begging, zero previous probs 
+                slab_probs[:, :, :, :, z0:(z_end-flush_end)] = slab_probs[:, :, :, :, flush_end:z_end]
+                slab_probs[:, :, :, :, (z_end-flush_end):] = 0
+                
+         # Final flush (if needed)
+        if last_flushed_z < D:
+            slab = slab_probs[:, :, :, :, last_flushed_z:]
+            weights = weights_accumulator[:, :, :, :, last_flushed_z:]
+            slab /= torch.clamp_min(weights, 1e-6)
+            slab_probs[:, :, :, :, last_flushed_z:] = slab
+            
+
+    return pred_seg, dist_probs, pulp_probs, weights_accumulator
+
+import torch
+import numpy as np
+import math
+from typing import Tuple, Optional
+
+
+def memory_efficient_inference_final(
+    args,
+    model: torch.nn.Module,
+    input_tensor: torch.Tensor,
+    patch_size: Tuple[int, int, int],
+    device: Optional[torch.device] = None,
+    device_aux: str = "gpu",
+    overlap: float = 0.25,
+    blend_mode: str = "gaussian",
+    sigma_scale: float = 0.125,
+    cast_dtype: torch.dtype = torch.float16,
+    dist_map_cast_dtype=torch.float32,
+    normalize_to_fp32: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Memory-efficient sliding-window inference with correct slab carry-over.
+
+    - Uses a single slab buffer `slab_probs` (CPU) of depth `slab_depth = pz + overlap_z`.
+    - Writes incoming patch contributions into local slab indices.
+    - After processing all XY patches for a z_start, flush the front (non-overlapping) part,
+      convert to uint8 labels, write to `pred_seg`, then shift the retained overlap to the
+      beginning of the slab buffer. No full multiclass volume is kept.
+    - Keeps full-volume weights/dist/pulp for now.
+    """
+
+    device = device or input_tensor.device
+    if device_aux == "gpu":
+        device_aux = device 
+    else:
+        device_aux = torch.device("cpu")
+    
+    _, _, H, W, D = input_tensor.shape  # input layout: (B=1, C_in, H, W, D)
+
+    # normalize overlap param into tuple
+    overlap = overlap if isinstance(overlap, (tuple, list)) else (overlap,) * len(patch_size)
+
+    # compute scan intervals and dense slices using your existing utils
+    scan_interval = _get_scan_interval((H, W, D), patch_size, len(patch_size), overlap)
+    slices = dense_patch_slices((H, W, D), patch_size, scan_interval)
+
+    # build list of unique z starts (in the same way dense_patch_slices generates them)
+    # helper to compute starts like dense_patch_slices does
+    def _starts(length, patch, stride):
+        if length <= patch:
+            return [0]
+        starts = list(range(0, length - patch + 1, stride))
+        if starts[-1] + patch < length:
+            starts.append(length - patch)
+        return starts
+
+    z_starts = _starts(D, patch_size[2], scan_interval[2])
+    # y_starts = _starts(W, patch_size[1], scan_interval[1])
+    # x_starts = _starts(H, patch_size[0], scan_interval[0])
+
+    # Group slices by z_start for robust processing (don't rely on dense_patch_slices ordering)
+    # Convert slices list to mapping: z_start -> list of slice-tuples
+    slices_by_z = {}
+    for s in slices:
+        z0 = s[2].start
+        slices_by_z.setdefault(z0, []).append(s)
+
+    # Sort z_starts ascending (should already be), and ensure mapping exists
+    z_starts = sorted(z_starts)
+    # sanity check: every z_start should be present as key in slices_by_z
+    # If not present, add empty list to preserve ordering
+    for z0 in z_starts:
+        slices_by_z.setdefault(z0, [])
+
+    # Derived params
+    pz = patch_size[2]
+    stride_z = scan_interval[2]  # step between z starts as computed by _get_scan_interval
+    overlap_z = max(0, pz - stride_z)  # may be 0 or positive
+    slab_depth = pz + overlap_z  # buffer depth to hold current pz + the overlap carried to next slab
+
+    # Importance map expected shape: (1,1,ph,pw,pz) matching your code
+    importance_map = compute_importance_map(
+        patch_size, mode=blend_mode, sigma_scale=sigma_scale, device=device, dtype=cast_dtype
+    )[None, None]  # (1,1,ph,pw,pz)
+
+    # Output segmentation (uint8) kept in CPU
+    pred_seg = torch.zeros((1, H, W, D), dtype=torch.uint8, device="cpu")
+
+    # Keep full-volume 1-channel accumulators as you requested (CPU)
+    weights_accumulator = torch.zeros((1, 1, H, W, D), dtype=cast_dtype, device=device_aux)
+    dist_probs = torch.zeros((1, 1, H, W, D), dtype=dist_map_cast_dtype, device=device_aux)
+    pulp_probs = torch.zeros((1, 1, H, W, D), dtype=cast_dtype, device=device_aux)
+
+    # The slab buffer lives on CPU and maps to global Z region [slab_start, slab_start + slab_depth)
+    slab_probs = torch.zeros((1, args.out_channels, H, W, slab_depth), dtype=cast_dtype, device='cpu')
+
+    # Initialize slab_start at the first z_start
+    slab_start = z_starts[0]
+    # We will ensure slab_start always equals the global Z coordinate of slab_probs[:, :,:,:,0]
+    # valid region within slab (how many slices currently filled) is tracked implicitly by slab contents,
+    # but mapping uses absolute coordinates.
+
+    # Process each z_start in order
+    n_z = len(z_starts)
+    with torch.inference_mode():
+        for z_idx, z0 in enumerate(z_starts):
+            # Process all XY patches that start at z = z0
+            for s in slices_by_z[z0]:
+                # slice tuples s = (slice_h, slice_w, slice_z)
+                # patch extraction consistent with your code: input_tensor[:, :, s[0], s[1], s[2]]
+                patch = input_tensor[:, :, s[0], s[1], s[2]].to(device, non_blocking=False)  # blocking to be safe
+                logits, dist_patch, pulp_patch = model(patch)
+
+                # compute weighted probabilities on GPU
+                weighted_probs = torch.softmax(logits.clamp(-15, 15), dim=1).to(cast_dtype)  # (1,C,ph,pw,pz)
+                weighted_probs = weighted_probs * importance_map  # broadcasting ok
+
+                weighted_dist = torch.sigmoid(dist_patch.clamp(-8, 8)).to(dist_map_cast_dtype) * importance_map
+                weighted_pulp = torch.sigmoid(pulp_patch.clamp(-8, 8)).to(cast_dtype) * importance_map
+
+                # Move to CPU (blocking copy)
+                weighted_probs = weighted_probs.to("cpu")           # (1,C,ph,pw,pz)
+                if device_aux != device:
+                    weighted_dist = weighted_dist.to(device_aux)            # (1,1,ph,pw,pz)
+                    weighted_pulp = weighted_pulp.to(device_aux)         # (1,1,ph,pw,pz)
+                    importance_map = importance_map.to(device_aux)          # (1,1,ph,pw,pz)
+
+                # Map patch Z-range into local slab coordinates
+                z_patch0 = s[2].start
+                z_patch1 = s[2].stop
+                local_z0 = z_patch0 - slab_start
+                local_z1 = z_patch1 - slab_start
+                if not (0 <= local_z0 <= slab_depth and 0 <= local_z1 <= slab_depth):
+                    # If patch extends beyond current slab buffer, that's unexpected:
+                    # it means slab_start is not aligned with z0. This can happen only if
+                    # slab_start was advanced beyond z0 incorrectly. Raise explicit error.
+                    raise RuntimeError(
+                        f"Patch z-range [{z_patch0},{z_patch1}) not mappable into slab "
+                        f"[{slab_start},{slab_start+slab_depth}). "
+                        "This indicates logic bug in slab_start tracking."
+                    )
+
+                # Accumulate into slab buffer and full-volume 1-channel maps
+                slab_probs[:, :, s[0], s[1], local_z0:local_z1] += weighted_probs
+                weights_accumulator[:, :, s[0], s[1], s[2]] += importance_map
+                dist_probs[:, :, s[0], s[1], s[2]] += weighted_dist
+                pulp_probs[:, :, s[0], s[1], s[2]] += weighted_pulp
+
+                # free GPU/large tensors
+                del patch, logits, weighted_probs, weighted_dist, weighted_pulp
+                torch.cuda.empty_cache()
+
+            # Finished all XY patches for current z0.
+            # Compute how many leading slices are now safe to flush.
+            if z_idx < (n_z - 1):
+                # Normal case: next z_start exists; flush up to z0 + stride_z (no further patches will touch below that)
+                next_z0 = z_starts[z_idx + 1]
+                # stride is next_z0 - z0, and flush_end is z0 + stride (equivalently next_z0)
+                flush_end = z0 + (next_z0 - z0)  # equals next_z0
+            else:
+                # Last z block: flush everything remaining in slab up to image end
+                flush_end = D
+
+            # We need to clamp flush_end to slab coverage: valid flush range is [slab_start, slab_start + slab_depth)
+            # flush_len is the number of slices from slab_start we can flush now
+            flush_end_clamped = min(flush_end, slab_start + slab_depth, D)
+            flush_len = flush_end_clamped - slab_start
+            if flush_len > 0:
+                # Normalize and argmax on the flushable portion
+                probs_slice = slab_probs[:, :, :, :, :flush_len]  # (1,C,H,W,flush_len)
+                weights_slice = weights_accumulator[:, :, :, :, slab_start: slab_start + flush_len].to('cpu')  # (1,1,H,W,flush_len)
+                # Convert to float32 for stable division if cast_dtype is float16
+                if normalize_to_fp32:
+                    probs_slice = (probs_slice.float() / weights_slice.float()).to(cast_dtype)
+                else:
+                    probs_slice /= weights_slice
+                # argmax -> (1,H,W,flush_len)
+                pred_slice = torch.argmax(probs_slice, dim=1).to(torch.uint8)  # (1,H,W,flush_len)
+                # write to final segmentation map
+                pred_seg[:, :, :, slab_start: slab_start + flush_len] = pred_slice
+
+                # If this is the last flush to end (flush_end == D), we're done; no need to shift buffer
+                if flush_end_clamped == D:
+                    # Done: break out early if desired (or continue loop; no more data will be added)
+                    # But ensure we do not attempt to shift beyond image end.
+                    # Clear slab and break
+                    # (No need to zero out the slab; function will return)
+                    slab_probs.zero_()  # optional free
+                    slab_start += flush_len  # equals D
+                    break
+
+                # Otherwise, we must shift the remaining overlap [flush_len : slab_depth) to the front
+                remaining = slab_depth - flush_len
+                if remaining > 0:
+                    # Move remaining slice block to the front
+                    slab_probs[:, :, :, :, :remaining] = slab_probs[:, :, :, :, flush_len: flush_len + remaining]
+                    # Zero the tail region to prepare for new incoming contributions
+                    slab_probs[:, :, :, :, remaining:] = 0
+                else:
+                    slab_probs.zero_()
+
+                # Advance slab_start by flush_len
+                slab_start += flush_len
+
+                # Note: weights_accumulator is global full-volume and we intentionally do NOT zero flushed weights here,
+                # because you requested to keep weights/dist/pulp for later. If you want to free them, you can zero
+                # weights_accumulator[..., slab_start - flush_len : slab_start] here to reclaim memory.
+
+        # End z loop. If slab_start < D (e.g., due to early break not occuring), do final flush
+        if slab_start < D:
+            # Remaining length
+            remaining_len = min(slab_depth, D - slab_start)
+            if remaining_len > 0:
+                probs_slice = slab_probs[:, :, :, :, :remaining_len].to(torch.float32)
+                denom = weights_accumulator[:, :, :, :, slab_start: slab_start + remaining_len].to(torch.float32)
+                probs_slice = probs_slice / torch.clamp_min(denom, 1e-6)
+                pred_slice = torch.argmax(probs_slice, dim=1).to(torch.uint8)
+                pred_seg[:, :, :, slab_start: slab_start + remaining_len] = pred_slice
+            # any further tail beyond slab buffer should already be handled because last z_start aligns so last patch reaches D
+
+    # Return segmentation (uint8) and full-volume aux outputs
+    return pred_seg, dist_probs, pulp_probs, weights_accumulator
 
 def split_infer_merge(
     image: torch.Tensor,
@@ -527,7 +839,7 @@ def inference_step(args, model, data_sample, transform, device):
 def main():
 
     is_ram_efficient_inference = True
-    is_new_inference = False
+    is_new_inference = True
 
     config_file = 'config.yaml'
     with open(config_file, 'r') as file:
@@ -568,7 +880,7 @@ def main():
     # data_sample = next(iter(dataloader))
     
     for data_sample in dataloader:
-
+        print(f"Processing image: {data_sample['image'].meta['filename_or_obj'][0]}, shape: {data_sample['image'].shape}")
         # max_voxels = 10*1024**3 // (48 * 2)
         # z_slab_max = max_voxels // (data_sample["image"].shape[-3] * data_sample["image"].shape[-2])
         # pz = args.patch_size[2]
@@ -582,21 +894,25 @@ def main():
                 #model
                 model = DWNet(spatial_dims=3, in_channels=1, out_channels=args.out_channels, act=args.activation, norm=args.norm,
                               bias=False, backbone_name=args.backbone_name, configuration='DIST_PULP')
-                model.load_state_dict(torch.load('checkpoints/checkpoints/popular_urial_2118/model_epoch_300.pth',
+                model.load_state_dict(torch.load('checkpoints/checkpoints/silent_pie_5061/model_epoch_300.pth',
                                                 map_location=device, weights_only=True)['model_state_dict'], strict=False)
                 model = model.to(device)
                 model.eval()
                 
+                print("Start inference...")
+                start_time = time.time()
                 if is_ram_efficient_inference:
                     if is_new_inference:
                         multiclass_probs, dist_probs, pulp_probs, weights_accumulator = \
-                            memory_efficient_inference_2(args, model, data_sample["image"], args.patch_size, device=device, overlap=0.25, blend_mode="gaussian",
-                                                        sigma_scale=0.125, cast_dtype=torch.float16, use_cuda_stream=False, memory_efficient=False)
+                            memory_efficient_inference_final(args, model, data_sample["image"], args.patch_size, device=device, overlap=0.25, blend_mode="gaussian",
+                                                        sigma_scale=0.125, cast_dtype=torch.float16, dist_map_cast_dtype=torch.float16)
                         model = free(model)
-                        multiclass_probs = multiclass_probs.to(device)
+                        #multiclass_probs = multiclass_probs.to(device)
                         # multiclass_pred = (multiclass_probs / weights_accumulator.cpu()).argmax(dim=1).squeeze().to(device=device, dtype=torch.uint8) 
-                        multiclass_pred = (multiclass_probs / weights_accumulator).argmax(dim=1).squeeze().to(device='cpu', dtype=torch.uint8) #min weights_acc is 1e-3 - min of gaussian map
-                        multiclass_probs = free(multiclass_probs)
+                        #multiclass_pred = (multiclass_probs / weights_accumulator).argmax(dim=1).squeeze().to(device='cpu', dtype=torch.uint8) #min weights_acc is 1e-3 - min of gaussian map
+                        multiclass_pred = multiclass_probs.squeeze() # TODO fix it 
+                        # print((multiclass_probs / weights_accumulator).float().sum())
+                        # multiclass_probs = free(multiclass_probs)
                         
                         binary_mask = torch.where(multiclass_pred >= 1, 1, 0).to(torch.int8).squeeze().cpu()
                         dist_pred =  nn.Threshold(1e-3, 0)(dist_probs / weights_accumulator).squeeze().cpu()
@@ -605,15 +921,21 @@ def main():
                         markers = torch.where(dist_pred > 0.5, 1, 0).to(torch.int8).squeeze().cpu()
                         pulp_segmentation = (pulp_probs / weights_accumulator > 0.5).to(torch.uint8).squeeze()
                         pulp_probs = free(pulp_probs)
+                        #time
+                        network_pass_time = time.time() - start_time
+                        print(f"Network pass time: {network_pass_time:.2f} seconds")
                     else:
                         multiclass_segmentation, dist_pred, pulp_segmentation = \
                             memory_efficient_inference_with_overlap(args, model, data_sample["image"], args.patch_size, device=device, overlap=0.25,
-                                                                    blend_mode="gaussian", sigma_scale=0.125, cast_dtype=torch.float16)
+                                                                    blend_mode="gaussian", sigma_scale=0.125, cast_dtype=torch.float16)                        
                         markers = torch.where(dist_pred > 0.5, 1, 0).to(torch.int8).squeeze().cpu()
                         dist_pred = dist_pred.squeeze().cpu()
                         pulp_segmentation = pulp_segmentation.squeeze()
                         binary_mask = torch.where(multiclass_segmentation >= 1, 1, 0).to(torch.int8).squeeze().cpu()
                         multiclass_pred = multiclass_segmentation.squeeze().cpu()
+                        #time
+                        network_pass_time = time.time() - start_time
+                        print(f"Network pass time: {network_pass_time:.2f} seconds")
                 else:
                     (multiclass_segmentation, dist_pred, pulp_segmentation) =  \
                         sliding_window_inference(data_sample["image"], roi_size=args.patch_size, sw_batch_size=1, predictor=model,
@@ -623,29 +945,44 @@ def main():
                     pulp_segmentation = (torch.sigmoid(pulp_segmentation) > 0.5).to(torch.int8).squeeze()
                     binary_mask = torch.where(multiclass_pred >= 1, 1, 0).to(torch.int8).squeeze().cpu()
                     markers = torch.where(dist_pred > 0.5, 1, 0).to(torch.int8).squeeze().cpu()
+                    #time
+                    network_pass_time = time.time() - start_time
+                    print(f"Network pass time: {network_pass_time:.2f} seconds")
         
+        post_proc_time = time.time()
         pred_multiclass = deep_watershed_with_voting_optimized(dist_pred.numpy(), 
                                                                multiclass_pred.numpy(), 
                                                                binary_mask.numpy(),
                                                                markers.numpy())
+        post_proc_time = time.time() - post_proc_time
+        print(f"Postproc pass time: {post_proc_time:.2f} seconds")
         
         print(np.unique(pred_multiclass))
         
-        with torch.no_grad():
-            pred_multiclass_gpu = torch.from_numpy(pred_multiclass).to(dtype=torch.long, device=device, non_blocking=True)
-            pred_with_pulp = merge_pulp_into_teeth_torch(pred_multiclass_gpu, pulp_segmentation, pulp_class=50).to(torch.int32) 
-            remapped = remap_labels_torch(pred_with_pulp, pred_to_challange_map)
+        pred_multiclass_gpu = torch.from_numpy(pred_multiclass).to(dtype=torch.long, device=device)
+        pred_with_pulp = merge_pulp_into_teeth_torch(pred_multiclass_gpu, pulp_segmentation, pulp_class=50).to(torch.int32) 
+        remapped = remap_labels_torch(pred_with_pulp, pred_to_challange_map)
             ### invert transforms, eg. padding
             # prediction = transform.post_inference_transform({"pred": MetaTensor(remapped.unsqueeze(0)), "image": data_sample["image"][0]})["pred"] # B,H,W,D
 
+        inference_time = time.time() - start_time
+        print(f"Inference time: {inference_time:.2f} seconds")
+        
         #SAVE RESULTS TO DISK TO PREVIEW
-        data_sample['pulp'] = MetaTensor(pulp_segmentation)
-        data_sample['dist'] = MetaTensor(dist_pred)
         data_sample['mlt'] = MetaTensor(pred_multiclass_gpu.unsqueeze(0).unsqueeze(0))
+        data_sample['pulp'] = MetaTensor(pulp_segmentation.unsqueeze(0).unsqueeze(0))
+        data_sample['dist'] = MetaTensor(dist_pred.unsqueeze(0).unsqueeze(0))
         data_sample['final'] = MetaTensor(remapped.unsqueeze(0).unsqueeze(0))
         
         inverted_prediction_mlt = [transform.post_inference_transform_no_dir(i) for i in decollate_batch(data_sample)] 
-        transform.save_inference_output(inverted_prediction_mlt[0])
+        save_transform = SaveMultipleKeysD(
+            keys=['mlt', 'pulp', 'dist', 'final'],
+            output_dir='output/inference_results',
+            output_postfixes=['mlt', 'pulp', 'dist', 'final'],
+            separate_folder=False,
+            output_dtype=[np.uint8, np.uint8, np.float32, np.uint8]
+        )
+        save_transform(inverted_prediction_mlt[0])
         
         #manual save - direct, no inversion, debug inversion
         # save_nifti(pred_multiclass_gpu_clone, path='output', filename="manual_mlt.nii.gz", pixdim=0.2, dtype=np.uint8)

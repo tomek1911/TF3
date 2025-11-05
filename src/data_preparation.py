@@ -208,16 +208,12 @@ class WatershedDistanceMapGenerator:
         max_coords = [int(c.max()) + 1 for c in coords]
         return tuple(slice(mi, ma) for mi, ma in zip(min_coords, max_coords))
     
-    def get_edt_map(self, label_volume, min_area=500, m=1):
+    def get_edt_map(self, label_volume, min_area=75, m=1):
         xp = self.xp
         edt = self.edt
-        unique_labels = np.unique(label_volume)
+        unique_labels = self.xp.unique(label_volume)
         unique_labels = unique_labels[unique_labels != 0]  # skip background
                 
-        labels = xp.asarray(label_volume)
-        distance_map = xp.zeros_like(labels, dtype=xp.float32)
-        
-        # ensure labels on correct device
         labels = xp.asarray(label_volume)
         distance_map = xp.zeros_like(labels, dtype=xp.float32)
 
@@ -226,7 +222,8 @@ class WatershedDistanceMapGenerator:
 
             class_mask = (labels == lbl_xp)
             voxel_count = int(xp.count_nonzero(class_mask))
-            if voxel_count < min_area:
+            if voxel_count < min_area and lbl not in [103,104,105]: # lingual nerve canal ID:105 and Incisive Canals (103, 104) can be very small or fragmented - keep them all
+                print(f"Skipping label {int(lbl)} with area {voxel_count} < min_area {min_area}")
                 continue
 
             bbox = self._get_bbox(class_mask)
@@ -267,7 +264,7 @@ class WatershedDistanceMapGenerator:
             # assign values from cropped_edt[local_indices] into distance_map[global_indices]
             distance_map[global_indices] = cropped_edt[local_indices]
 
-        distance_map[distance_map < 1e-2] = 0
+        distance_map[distance_map < 1e-3] = 0
 
         if self.device == "cuda":
             distance_map = xp.asnumpy(distance_map)
@@ -295,7 +292,7 @@ def generate_watershed_maps(input_data_list, output_dir, device='cuda'):
     Each item is a dictionary with 'image' and 'label' keys.
     """
     distance_map_gen = WatershedDistanceMapGenerator(device=device)      
-    for item in tqdm(input_data_list):
+    for item in tqdm(input_data_list, desc="Generating watershed maps"):
         nib_vol = nib.load(item)
         label_volume = np.asanyarray(nib_vol.dataobj, dtype=np.uint8) 
            
@@ -306,34 +303,42 @@ def generate_watershed_maps(input_data_list, output_dir, device='cuda'):
         # Prepare header file
         # Use the header of the first image, but adjust dimensionality
         #DIR
-        hdr = nib_vol.header.copy()
+        hdr = nib.Nifti1Header()
+        src_hdr = nib_vol.header
+        for key in [
+            'pixdim', 'xyzt_units', 'qform_code', 'sform_code',
+            'quatern_b', 'quatern_c', 'quatern_d',
+            'qoffset_x', 'qoffset_y', 'qoffset_z',
+            'srow_x', 'srow_y', 'srow_z'
+        ]:
+            hdr[key] = src_hdr[key]
+
         hdr.set_data_dtype(np.float32)
-        hdr.set_data_shape(dir_map.shape)
-        hdr['dim'][0] = 4                 # number of dimensions: H,W,D, 3 dir channels
+        hdr['dim'][0] = 4                 # number of dimensions: H,W,D,C (3 dir channels)
         hdr['dim'][1] = dir_map.shape[0]  # X
         hdr['dim'][2] = dir_map.shape[1]  # Y
         hdr['dim'][3] = dir_map.shape[2]  # Z
-        hdr['dim'][4] = dir_map.shape[3]  # channels (C)
-        hdr['intent_code'] = 1007         # NIFTI_INTENT_VECTOR
+        hdr['dim'][4] = 3  # 3 direction channels (C)
+        # Intent
+        hdr['intent_code'] = 2001          # NIFTI_INTENT_TIME_SERIES
         hdr['intent_name'] = b'Vector'
+
+        # Neutral scaling and display window
+        hdr['scl_slope'] = 1.0
+        hdr['scl_inter'] = 0.0
+        hdr['cal_min'] = -1.0
+        hdr['cal_max'] = 1.0
+        
         # Save
         file_name = item.split('/')[-1].replace('_primary.nii.gz', '.nii.gz')
-        nib.save(nib.Nifti1Image(dist_map, nib_vol.affine), os.path.join(os.path.dirname(output_dir), 'distance_maps', file_name))
         nib.save(nib.Nifti1Image(dir_map, affine=nib_vol.affine, header=hdr), os.path.join(os.path.dirname(output_dir), 'direction_maps', file_name))
+        nib.save(nib.Nifti1Image(dist_map, affine=nib_vol.affine), os.path.join(os.path.dirname(output_dir), 'distance_maps', file_name))
         
         # DIST_DIR combined
         dist_map_ch = dist_map[..., np.newaxis]           # shape (X, Y, Z, 1)
-        combined_maps = np.concatenate([dist_map_ch, dir_map], axis=-1)  # shape: (X, Y, Z, 4) - monai will solve ensure channel first for pytorch
-        
-        hdr.set_data_shape(combined_maps.shape)
-        hdr['dim'][0] = 4                       # number of dimensions
-        hdr['dim'][1] = combined_maps.shape[0]  # X
-        hdr['dim'][2] = combined_maps.shape[1]  # Y
-        hdr['dim'][3] = combined_maps.shape[2]  # Z
-        hdr['dim'][4] = combined_maps.shape[3]  # channels (C)
-        hdr['intent_code'] = 1007               # NIFTI_INTENT_VECTOR
-        hdr['intent_name'] = b'Vector'
-        
+        combined_maps = np.concatenate([dist_map_ch, dir_map], axis=-1)  # shape: (X, Y, Z, 4) - monai will solve ensure channel first for pytorch -> 4,X,Y,Z
+        # Now data shape is (X, Y, Z, 4)
+        hdr['dim'][4] = 4
         # Save
         nib.save(nib.Nifti1Image(combined_maps, affine=nib_vol.affine, header=hdr), os.path.join(os.path.dirname(output_dir), 'distdir_maps', file_name))
         

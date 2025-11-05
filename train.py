@@ -492,6 +492,8 @@ def main():
 
         print("Saved class distribution to class_distribution.json")
         
+        
+    experiment.log_parameters(args)
     for epoch in tqdm(range(args.start_epoch, args.epochs+1), desc="Epochs", file=sys.stderr,
                       position=0, leave=True, disable=disable_tqdm):
         
