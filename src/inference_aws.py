@@ -3,6 +3,7 @@ import time
 import argparse
 import yaml
 import math
+import warnings
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional
@@ -12,13 +13,16 @@ import SimpleITK as sitk
 import nibabel as nib
 from nibabel.orientations import aff2axcodes
 
+from functools import partial
 from contextlib import nullcontext
 from copy import copy
 from monai.data import DataLoader, decollate_batch
 from monai.data.dataset import Dataset
 from monai.data.meta_tensor import MetaTensor
-from monai.data.utils import compute_importance_map, BlendMode
+from monai.networks.utils import one_hot
 from monai.inferers.utils import compute_importance_map
+
+from monai.metrics import DiceMetric, HausdorffDistanceMetric
 
 from deep_watershed import deep_watershed_with_voting, deep_watershed_with_voting_optimized
 from inference_utils import merge_pulp_into_teeth_torch, remap_labels_torch, pred_to_challange_map, save_nifti
@@ -492,12 +496,6 @@ def memory_efficient_inference_3(
 
     return pred_seg, dist_probs, pulp_probs, weights_accumulator
 
-import torch
-import numpy as np
-import math
-from typing import Tuple, Optional
-
-
 def memory_efficient_inference_final(
     args,
     model: torch.nn.Module,
@@ -531,14 +529,10 @@ def memory_efficient_inference_final(
     
     _, _, H, W, D = input_tensor.shape  # input layout: (B=1, C_in, H, W, D)
 
-    # normalize overlap param into tuple
     overlap = overlap if isinstance(overlap, (tuple, list)) else (overlap,) * len(patch_size)
-
-    # compute scan intervals and dense slices using your existing utils
     scan_interval = _get_scan_interval((H, W, D), patch_size, len(patch_size), overlap)
     slices = dense_patch_slices((H, W, D), patch_size, scan_interval)
 
-    # build list of unique z starts (in the same way dense_patch_slices generates them)
     # helper to compute starts like dense_patch_slices does
     def _starts(length, patch, stride):
         if length <= patch:
@@ -549,170 +543,147 @@ def memory_efficient_inference_final(
         return starts
 
     z_starts = _starts(D, patch_size[2], scan_interval[2])
-    # y_starts = _starts(W, patch_size[1], scan_interval[1])
-    # x_starts = _starts(H, patch_size[0], scan_interval[0])
 
-    # Group slices by z_start for robust processing (don't rely on dense_patch_slices ordering)
-    # Convert slices list to mapping: z_start -> list of slice-tuples
     slices_by_z = {}
     for s in slices:
         z0 = s[2].start
         slices_by_z.setdefault(z0, []).append(s)
 
-    # Sort z_starts ascending (should already be), and ensure mapping exists
-    z_starts = sorted(z_starts)
-    # sanity check: every z_start should be present as key in slices_by_z
-    # If not present, add empty list to preserve ordering
-    for z0 in z_starts:
-        slices_by_z.setdefault(z0, [])
-
-    # Derived params
     pz = patch_size[2]
     stride_z = scan_interval[2]  # step between z starts as computed by _get_scan_interval
-    overlap_z = max(0, pz - stride_z)  # may be 0 or positive
-    slab_depth = pz + overlap_z  # buffer depth to hold current pz + the overlap carried to next slab
+    overlap_z = max(0, pz - stride_z)
 
-    # Importance map expected shape: (1,1,ph,pw,pz) matching your code
+    # (1,1,ph,pw,pz)
     importance_map = compute_importance_map(
         patch_size, mode=blend_mode, sigma_scale=sigma_scale, device=device, dtype=cast_dtype
-    )[None, None]  # (1,1,ph,pw,pz)
+    )[None, None]  
 
     # Output segmentation (uint8) kept in CPU
     pred_seg = torch.zeros((1, H, W, D), dtype=torch.uint8, device="cpu")
 
-    # Keep full-volume 1-channel accumulators as you requested (CPU)
+    # 1-channel accumulators, kept on gpu or cpu
     weights_accumulator = torch.zeros((1, 1, H, W, D), dtype=cast_dtype, device=device_aux)
     dist_probs = torch.zeros((1, 1, H, W, D), dtype=dist_map_cast_dtype, device=device_aux)
     pulp_probs = torch.zeros((1, 1, H, W, D), dtype=cast_dtype, device=device_aux)
 
-    # The slab buffer lives on CPU and maps to global Z region [slab_start, slab_start + slab_depth)
-    slab_probs = torch.zeros((1, args.out_channels, H, W, slab_depth), dtype=cast_dtype, device='cpu')
+    # The slab temp probs buffer lives on CPU and maps to global Z region [slab_start, slab_start + slab_depth)
+    slab_probs = torch.zeros((1, args.out_channels, H, W, pz), dtype=cast_dtype, device='cpu')
 
     # Initialize slab_start at the first z_start
     slab_start = z_starts[0]
-    # We will ensure slab_start always equals the global Z coordinate of slab_probs[:, :,:,:,0]
-    # valid region within slab (how many slices currently filled) is tracked implicitly by slab contents,
-    # but mapping uses absolute coordinates.
 
-    # Process each z_start in order
     n_z = len(z_starts)
-    with torch.inference_mode():
-        for z_idx, z0 in enumerate(z_starts):
-            # Process all XY patches that start at z = z0
-            for s in slices_by_z[z0]:
-                # slice tuples s = (slice_h, slice_w, slice_z)
-                # patch extraction consistent with your code: input_tensor[:, :, s[0], s[1], s[2]]
-                patch = input_tensor[:, :, s[0], s[1], s[2]].to(device, non_blocking=False)  # blocking to be safe
-                logits, dist_patch, pulp_patch = model(patch)
 
-                # compute weighted probabilities on GPU
-                weighted_probs = torch.softmax(logits.clamp(-15, 15), dim=1).to(cast_dtype)  # (1,C,ph,pw,pz)
-                weighted_probs = weighted_probs * importance_map  # broadcasting ok
+    for z_idx, z0 in enumerate(z_starts):
+        # Process all XY patches that start at z = z0
+        for s in slices_by_z[z0]:
+            logits, dist_patch, pulp_patch = model(input_tensor[:, :, s[0], s[1], s[2]])
 
-                weighted_dist = torch.sigmoid(dist_patch.clamp(-8, 8)).to(dist_map_cast_dtype) * importance_map
-                weighted_pulp = torch.sigmoid(pulp_patch.clamp(-8, 8)).to(cast_dtype) * importance_map
+            # compute weighted probabilities on GPU, clamp to avoid overflow during NORMALIZATION in float16
+            # weighted_probs = torch.softmax(logits.clamp(-15, 15), dim=1).to(cast_dtype) * importance_map
+            # weighted_dist = torch.sigmoid(dist_patch.clamp(-8, 8)).to(dist_map_cast_dtype) * importance_map
+            # weighted_pulp = torch.sigmoid(pulp_patch.clamp(-8, 8)).to(cast_dtype) * importance_map
+            weighted_probs = torch.softmax(logits, dim=1).to(cast_dtype) * importance_map
+            weighted_dist = torch.sigmoid(dist_patch).to(dist_map_cast_dtype) * importance_map
+            weighted_pulp = torch.sigmoid(pulp_patch).to(cast_dtype) * importance_map
 
-                # Move to CPU (blocking copy)
-                weighted_probs = weighted_probs.to("cpu")           # (1,C,ph,pw,pz)
-                if device_aux != device:
-                    weighted_dist = weighted_dist.to(device_aux)            # (1,1,ph,pw,pz)
-                    weighted_pulp = weighted_pulp.to(device_aux)         # (1,1,ph,pw,pz)
-                    importance_map = importance_map.to(device_aux)          # (1,1,ph,pw,pz)
+            weighted_probs = weighted_probs.to("cpu")          
+            if device_aux != device:
+                weighted_dist = weighted_dist.to(device_aux)
+                weighted_pulp = weighted_pulp.to(device_aux)
+                importance_map = importance_map.to(device_aux)
 
-                # Map patch Z-range into local slab coordinates
-                z_patch0 = s[2].start
-                z_patch1 = s[2].stop
-                local_z0 = z_patch0 - slab_start
-                local_z1 = z_patch1 - slab_start
-                if not (0 <= local_z0 <= slab_depth and 0 <= local_z1 <= slab_depth):
-                    # If patch extends beyond current slab buffer, that's unexpected:
-                    # it means slab_start is not aligned with z0. This can happen only if
-                    # slab_start was advanced beyond z0 incorrectly. Raise explicit error.
-                    raise RuntimeError(
-                        f"Patch z-range [{z_patch0},{z_patch1}) not mappable into slab "
-                        f"[{slab_start},{slab_start+slab_depth}). "
-                        "This indicates logic bug in slab_start tracking."
-                    )
+            # # Map patch Z-range into local slab coordinates
+            # z_patch0 = s[2].start
+            # z_patch1 = s[2].stop
+            # local_z0 = z_patch0 - slab_start
+            # local_z1 = z_patch1 - slab_start
+            # if not (0 <= local_z0 <= slab_depth and 0 <= local_z1 <= slab_depth):
+            #     # If patch extends beyond current slab buffer, that's unexpected:
+            #     # it means slab_start is not aligned with z0. This can happen only if
+            #     # slab_start was advanced beyond z0 incorrectly. Raise explicit error.
+            #     raise RuntimeError(
+            #         f"Patch z-range [{z_patch0},{z_patch1}) not mappable into slab "
+            #         f"[{slab_start},{slab_start+slab_depth}). "
+            #         "This indicates logic bug in slab_start tracking."
+            #     )
 
-                # Accumulate into slab buffer and full-volume 1-channel maps
-                slab_probs[:, :, s[0], s[1], local_z0:local_z1] += weighted_probs
-                weights_accumulator[:, :, s[0], s[1], s[2]] += importance_map
-                dist_probs[:, :, s[0], s[1], s[2]] += weighted_dist
-                pulp_probs[:, :, s[0], s[1], s[2]] += weighted_pulp
+            # Accumulate into slab buffer and full-volume 1-channel maps
+            slab_probs[:, :, s[0], s[1], :] += weighted_probs #CPU
+            weights_accumulator[:, :, s[0], s[1], s[2]] += importance_map
+            dist_probs[:, :, s[0], s[1], s[2]] += weighted_dist
+            pulp_probs[:, :, s[0], s[1], s[2]] += weighted_pulp
 
-                # free GPU/large tensors
-                del patch, logits, weighted_probs, weighted_dist, weighted_pulp
-                torch.cuda.empty_cache()
+            # free GPU/large tensors
+            del logits, weighted_probs, weighted_dist, weighted_pulp
+            torch.cuda.empty_cache()
 
-            # Finished all XY patches for current z0.
-            # Compute how many leading slices are now safe to flush.
-            if z_idx < (n_z - 1):
-                # Normal case: next z_start exists; flush up to z0 + stride_z (no further patches will touch below that)
-                next_z0 = z_starts[z_idx + 1]
-                # stride is next_z0 - z0, and flush_end is z0 + stride (equivalently next_z0)
-                flush_end = z0 + (next_z0 - z0)  # equals next_z0
+        # Finished all XY patches for current z0.
+        # Compute how many leading slices are now safe to flush.
+        if z_idx < (n_z - 1):
+            # Normal case: next z_start exists; flush up to z0 + stride_z (no further patches will touch below that)
+            next_z0 = z_starts[z_idx + 1]
+            # stride is next_z0 - z0, and flush_end is z0 + stride (equivalently next_z0)
+            flush_end = z0 + (next_z0 - z0)  # equals next_z0
+        else:
+            # Last z block: flush everything remaining in slab up to image end
+            flush_end = D
+
+        # We need to clamp flush_end to slab coverage: valid flush range is [slab_start, slab_start + slab_depth)
+        # flush_len is the number of slices from slab_start we can flush now
+        flush_end_clamped = min(flush_end, slab_start + pz, D)
+        flush_len = flush_end_clamped - slab_start
+        if flush_len > 0:
+            # Normalize and argmax on the flushable portion
+            if flush_end_clamped == D:
+                probs_slice = slab_probs  # safe: nothing will be reused
             else:
-                # Last z block: flush everything remaining in slab up to image end
-                flush_end = D
+                probs_slice = slab_probs[:, :, :, :, :flush_len].clone() # (1,C,H,W,flush_len)
+            weights_slice = weights_accumulator[:, :, :, :, slab_start: slab_start + flush_len].to('cpu')  # (1,1,H,W,flush_len)
+            # Convert to float32 for stable division if cast_dtype is float16
+            if normalize_to_fp32:
+                probs_slice = (probs_slice.float() / weights_slice.float()).to(cast_dtype)
+            else:
+                probs_slice /= weights_slice
+            # argmax -> (1,H,W,flush_len)
+            pred_slice = torch.argmax(probs_slice, dim=1).to(torch.uint8)  # (1,H,W,flush_len)
+            # write to final segmentation map
+            pred_seg[:, :, :, slab_start: slab_start + flush_len] = pred_slice
 
-            # We need to clamp flush_end to slab coverage: valid flush range is [slab_start, slab_start + slab_depth)
-            # flush_len is the number of slices from slab_start we can flush now
-            flush_end_clamped = min(flush_end, slab_start + slab_depth, D)
-            flush_len = flush_end_clamped - slab_start
-            if flush_len > 0:
-                # Normalize and argmax on the flushable portion
-                probs_slice = slab_probs[:, :, :, :, :flush_len]  # (1,C,H,W,flush_len)
-                weights_slice = weights_accumulator[:, :, :, :, slab_start: slab_start + flush_len].to('cpu')  # (1,1,H,W,flush_len)
-                # Convert to float32 for stable division if cast_dtype is float16
-                if normalize_to_fp32:
-                    probs_slice = (probs_slice.float() / weights_slice.float()).to(cast_dtype)
-                else:
-                    probs_slice /= weights_slice
-                # argmax -> (1,H,W,flush_len)
-                pred_slice = torch.argmax(probs_slice, dim=1).to(torch.uint8)  # (1,H,W,flush_len)
-                # write to final segmentation map
-                pred_seg[:, :, :, slab_start: slab_start + flush_len] = pred_slice
-
-                # If this is the last flush to end (flush_end == D), we're done; no need to shift buffer
-                if flush_end_clamped == D:
-                    # Done: break out early if desired (or continue loop; no more data will be added)
-                    # But ensure we do not attempt to shift beyond image end.
-                    # Clear slab and break
-                    # (No need to zero out the slab; function will return)
-                    slab_probs.zero_()  # optional free
-                    slab_start += flush_len  # equals D
-                    break
-
-                # Otherwise, we must shift the remaining overlap [flush_len : slab_depth) to the front
-                remaining = slab_depth - flush_len
-                if remaining > 0:
-                    # Move remaining slice block to the front
-                    slab_probs[:, :, :, :, :remaining] = slab_probs[:, :, :, :, flush_len: flush_len + remaining]
-                    # Zero the tail region to prepare for new incoming contributions
-                    slab_probs[:, :, :, :, remaining:] = 0
-                else:
-                    slab_probs.zero_()
-
-                # Advance slab_start by flush_len
+            # If this is the last flush to end (flush_end == D), we're done; no need to shift buffer
+            if flush_end_clamped == D:
                 slab_start += flush_len
+                break
 
-                # Note: weights_accumulator is global full-volume and we intentionally do NOT zero flushed weights here,
-                # because you requested to keep weights/dist/pulp for later. If you want to free them, you can zero
-                # weights_accumulator[..., slab_start - flush_len : slab_start] here to reclaim memory.
+            # Shift remaining slab portion (the overlap) to the front of slab_probs
+            carry_len = max(0, (slab_start + pz) - flush_end_clamped)
+            if carry_len > 0:
+                # Move remaining slice block to the front
+                slab_probs[:, :, :, :, :carry_len] = slab_probs[:, :, :, :, flush_len: flush_len + carry_len]
+                # Zero the tail region to prepare for new incoming contributions
+                slab_probs[:, :, :, :, carry_len:] = 0
+            else:
+                slab_probs.zero_()
 
-        # End z loop. If slab_start < D (e.g., due to early break not occuring), do final flush
-        if slab_start < D:
-            # Remaining length
-            remaining_len = min(slab_depth, D - slab_start)
-            if remaining_len > 0:
-                probs_slice = slab_probs[:, :, :, :, :remaining_len].to(torch.float32)
-                denom = weights_accumulator[:, :, :, :, slab_start: slab_start + remaining_len].to(torch.float32)
-                probs_slice = probs_slice / torch.clamp_min(denom, 1e-6)
-                pred_slice = torch.argmax(probs_slice, dim=1).to(torch.uint8)
-                pred_seg[:, :, :, slab_start: slab_start + remaining_len] = pred_slice
-            # any further tail beyond slab buffer should already be handled because last z_start aligns so last patch reaches D
+            # Advance slab_start by flush_len
+            slab_start += flush_len
+            # Note: weights_accumulator is global full-volume and we intentionally do NOT zero flushed weights here
 
-    # Return segmentation (uint8) and full-volume aux outputs
+    # This should never trigger; retained as a safeguard for misaligned patch sets
+    if slab_start < D:
+        print("WARNING: Final slab flush triggered. This indicates logic bug in slab tracking.")
+        # Remaining length
+        remaining_len = min(pz, D - slab_start)
+        if remaining_len > 0:
+            probs_slice = slab_probs[:, :, :, :, :remaining_len]
+            weights_slice = weights_accumulator[:, :, :, :, slab_start: slab_start + remaining_len].to('cpu')
+            if normalize_to_fp32:
+                probs_slice = (probs_slice.float() / weights_slice.float()).to(cast_dtype)
+            else:
+                probs_slice /= weights_slice
+            pred_slice = torch.argmax(probs_slice, dim=1).to(torch.uint8)
+            pred_seg[:, :, :, slab_start: slab_start + remaining_len] = pred_slice
+
     return pred_seg, dist_probs, pulp_probs, weights_accumulator
 
 def split_infer_merge(
@@ -839,7 +810,6 @@ def inference_step(args, model, data_sample, transform, device):
 def main():
 
     is_ram_efficient_inference = True
-    is_new_inference = True
 
     config_file = 'config.yaml'
     with open(config_file, 'r') as file:
@@ -856,30 +826,42 @@ def main():
         return t.cpu().numpy()
 
     device = get_default_device()
+    args.keys = ['image', 'label']
     transform = Transforms(args, device=device)
     input_image = [
         # {"image": "data/imagesTr/ToothFairy3F_001_0000.nii.gz"},
         # {"image": "data/imagesTr/ToothFairy3F_005_0000.nii.gz"},
-        {"image": "data/imagesTr/ToothFairy3F_009_0000.nii.gz"}, #VAL
-        {"image": "data/imagesTr/ToothFairy3F_013_0000.nii.gz"}, #VAL
+        {"image": "data/imagesTr/ToothFairy3F_009_0000.nii.gz",
+         "label": "data/labelsTr/ToothFairy3F_009.nii.gz"}, #VAL
+        {"image": "data/imagesTr/ToothFairy3F_013_0000.nii.gz",
+         "label": "data/labelsTr/ToothFairy3F_013.nii.gz"}, #VAL
         # {"image": "data/imagesTr/ToothFairy3F_010_0000.nii.gz"},
-        {"image": "data/imagesTr/ToothFairy3P_059_0000.nii.gz"}, #VAL
-        {"image": "data/imagesTr/ToothFairy3P_095_0000.nii.gz"}, #VAL
+        {"image": "data/imagesTr/ToothFairy3P_059_0000.nii.gz",
+         "label": "data/labelsTr/ToothFairy3P_059.nii.gz"}, #VAL
+        {"image": "data/imagesTr/ToothFairy3P_095_0000.nii.gz",
+         "label": "data/labelsTr/ToothFairy3P_095.nii.gz"}, #VAL
         # {"image": "data/imagesTr/ToothFairy3P_381_0000.nii.gz"},
         # {"image": "data/imagesTr/ToothFairy3P_386_0000.nii.gz"},
         # {"image": "data/imagesTr/ToothFairy3P_391_0000.nii.gz"},
-        {"image": "data/imagesTr/ToothFairy3S_0001_0000.nii.gz"}, #VAL
-        {"image": "data/imagesTr/ToothFairy3S_0014_0000.nii.gz"}, #VAL
+        {"image": "data/imagesTr/ToothFairy3S_0001_0000.nii.gz",
+         "label": "data/imagesTr/ToothFairy3S_0001.nii.gz"}, #VAL
+        {"image": "data/imagesTr/ToothFairy3S_0014_0000.nii.gz",
+         "label": "data/imagesTr/ToothFairy3S_0014.nii.gz"}, #VAL
         # {"image": "data/imagesTr/ToothFairy3S_0005_0000.nii.gz"},
         # {"image": "data/imagesTr/ToothFairy3S_0010_0000.nii.gz"},
         # {"image": "data/imagesTr/ToothFairy3S_0015_0000.nii.gz"},
     ]
     
-    dataset = Dataset(data=input_image, transform=transform.inference_preprocessing)
+    dataset = Dataset(data=input_image, transform=transform.inference_transform_with_labels)
     dataloader = DataLoader(dataset, batch_size=1, num_workers=0)
     # data_sample = next(iter(dataloader))
     
+    dice_metric = DiceMetric(include_background=False, reduction="none", get_not_nans=False, ignore_empty=True)
+    hausdorf95 = HausdorffDistanceMetric(include_background=False, reduction="none", distance_metric='euclidean', percentile=95, get_not_nans=False, directed=False)
+    
     for data_sample in dataloader:
+        # data_sample["image"].data = torch.rand(size=(1,1,800,800,400))
+        
         print(f"Processing image: {data_sample['image'].meta['filename_or_obj'][0]}, shape: {data_sample['image'].shape}")
         # max_voxels = 10*1024**3 // (48 * 2)
         # z_slab_max = max_voxels // (data_sample["image"].shape[-3] * data_sample["image"].shape[-2])
@@ -888,59 +870,61 @@ def main():
         #     print("pixdim should be lower, cannot fit in RAM single patch_size z layer")
     
         # data_sample = transform.inference_preprocessing(input_image)
-        
-        with torch.amp.autocast(enabled=True, dtype=torch.float16, device_type=device.type):
-            with torch.no_grad():
-                #model
-                model = DWNet(spatial_dims=3, in_channels=1, out_channels=args.out_channels, act=args.activation, norm=args.norm,
-                              bias=False, backbone_name=args.backbone_name, configuration='DIST_PULP')
-                model.load_state_dict(torch.load('checkpoints/checkpoints/silent_pie_5061/model_epoch_300.pth',
-                                                map_location=device, weights_only=True)['model_state_dict'], strict=False)
-                model = model.to(device)
-                model.eval()
+ 
+        #model
+        model = DWNet(spatial_dims=3, in_channels=1, out_channels=args.out_channels, act=args.activation, norm=args.norm,
+                        bias=False, backbone_name=args.backbone_name, configuration='DIST_PULP')
+        model.load_state_dict(torch.load('checkpoints/checkpoints/suitable_mastodon_3783/model_epoch_300.pth',
+                                        map_location=device, weights_only=True)['model_state_dict'], strict=False)
+        model = model.to(device)
+        model.eval()
                 
+        with torch.inference_mode():
+            with torch.amp.autocast(enabled=True, dtype=torch.float16, device_type=device.type):
                 print("Start inference...")
                 start_time = time.time()
                 if is_ram_efficient_inference:
-                    if is_new_inference:
-                        multiclass_probs, dist_probs, pulp_probs, weights_accumulator = \
-                            memory_efficient_inference_final(args, model, data_sample["image"], args.patch_size, device=device, overlap=0.25, blend_mode="gaussian",
-                                                        sigma_scale=0.125, cast_dtype=torch.float16, dist_map_cast_dtype=torch.float16)
-                        model = free(model)
-                        #multiclass_probs = multiclass_probs.to(device)
-                        # multiclass_pred = (multiclass_probs / weights_accumulator.cpu()).argmax(dim=1).squeeze().to(device=device, dtype=torch.uint8) 
-                        #multiclass_pred = (multiclass_probs / weights_accumulator).argmax(dim=1).squeeze().to(device='cpu', dtype=torch.uint8) #min weights_acc is 1e-3 - min of gaussian map
-                        multiclass_pred = multiclass_probs.squeeze() # TODO fix it 
-                        # print((multiclass_probs / weights_accumulator).float().sum())
-                        # multiclass_probs = free(multiclass_probs)
-                        
-                        binary_mask = torch.where(multiclass_pred >= 1, 1, 0).to(torch.int8).squeeze().cpu()
-                        dist_pred =  nn.Threshold(1e-3, 0)(dist_probs / weights_accumulator).squeeze().cpu()
-                        dist_probs = free(dist_probs)
-                        
-                        markers = torch.where(dist_pred > 0.5, 1, 0).to(torch.int8).squeeze().cpu()
-                        pulp_segmentation = (pulp_probs / weights_accumulator > 0.5).to(torch.uint8).squeeze()
-                        pulp_probs = free(pulp_probs)
-                        #time
-                        network_pass_time = time.time() - start_time
-                        print(f"Network pass time: {network_pass_time:.2f} seconds")
-                    else:
-                        multiclass_segmentation, dist_pred, pulp_segmentation = \
-                            memory_efficient_inference_with_overlap(args, model, data_sample["image"], args.patch_size, device=device, overlap=0.25,
-                                                                    blend_mode="gaussian", sigma_scale=0.125, cast_dtype=torch.float16)                        
-                        markers = torch.where(dist_pred > 0.5, 1, 0).to(torch.int8).squeeze().cpu()
-                        dist_pred = dist_pred.squeeze().cpu()
-                        pulp_segmentation = pulp_segmentation.squeeze()
-                        binary_mask = torch.where(multiclass_segmentation >= 1, 1, 0).to(torch.int8).squeeze().cpu()
-                        multiclass_pred = multiclass_segmentation.squeeze().cpu()
-                        #time
-                        network_pass_time = time.time() - start_time
-                        print(f"Network pass time: {network_pass_time:.2f} seconds")
+                    multiclass_pred, dist_pred, pulp_segmentation, weights_accumulator = \
+                        memory_efficient_inference_final(args, model, data_sample["image"], args.patch_size, device=device, overlap=0.1125, blend_mode="gaussian",
+                                                    sigma_scale=0.125, cast_dtype=torch.float16, dist_map_cast_dtype=torch.float16, normalize_to_fp32=False)
+                    model = free(model)
+                    multiclass_pred = multiclass_pred.squeeze()
+                    binary_mask = multiclass_pred.ge(1).to(torch.int8).squeeze().cpu()
+                    dist_pred.div_(weights_accumulator) 
+                    dist_pred.masked_fill_(dist_pred < 1e-3, 0)
+                    markers = (dist_pred > 0.5).to(torch.int8).squeeze().cpu()
+                    dist_pred = dist_pred.squeeze().cpu() 
+                    
+                    pulp_segmentation.div_(weights_accumulator) 
+                    pulp_segmentation.gt_(0.5) 
+                    pulp_segmentation = pulp_segmentation.to(torch.uint8).squeeze()
+                    
+                    #time
+                    network_pass_time = time.time() - start_time
+                    print(f"Network pass time: {network_pass_time:.2f} seconds")
                 else:
-                    (multiclass_segmentation, dist_pred, pulp_segmentation) =  \
-                        sliding_window_inference(data_sample["image"], roi_size=args.patch_size, sw_batch_size=1, predictor=model,
-                                                 overlap=0.25, sw_device=device, device=device, mode='gaussian', sigma_scale=0.125, padding_mode='constant', cval=0, progress=False)
-                    multiclass_pred = multiclass_segmentation.argmax(dim=1, keepdim=True).squeeze().cpu()
+                    def _predictor_fn(x, **kwargs):
+                        seg_logits, dist, pulp = model(x)
+                        is_buffered = kwargs.get("is_buffered", False)
+                        if is_buffered:
+                            return torch.cat([seg_logits, dist, pulp], dim=1) # [B, C+2 (48), H, W, D], unpack later
+                        else:
+                            return (seg_logits, dist, pulp)
+                    
+                    buffer_steps = None
+                    is_buffered = buffer_steps is not None
+                    buffer_dim = 0 #buffer along batch dimension
+                    output =  \
+                        sliding_window_inference(data_sample["image"], roi_size=args.patch_size, sw_batch_size=1, predictor=_predictor_fn,
+                                                 overlap=0.1125, sw_device=device, device='cpu', mode='gaussian', sigma_scale=0.125,
+                                                 padding_mode='constant', cval=0, progress=False, buffer_steps=buffer_steps, buffer_dim=buffer_dim, is_buffered=is_buffered)
+                    if is_buffered: #unpack
+                        logits_multiclass = output[:, :args.out_channels, ...]
+                        dist_pred = output[:, args.out_channels:args.out_channels+1, ...]
+                        pulp_segmentation = output[:, args.out_channels+1:, ...]
+                    else:
+                        (logits_multiclass, dist_pred, pulp_segmentation) = output
+                    multiclass_pred = logits_multiclass.argmax(dim=1, keepdim=True).squeeze().cpu()
                     dist_pred = nn.Threshold(1e-3, 0)(torch.sigmoid(dist_pred)).to(torch.float16).squeeze().cpu()
                     pulp_segmentation = (torch.sigmoid(pulp_segmentation) > 0.5).to(torch.int8).squeeze()
                     binary_mask = torch.where(multiclass_pred >= 1, 1, 0).to(torch.int8).squeeze().cpu()
@@ -955,34 +939,57 @@ def main():
                                                                binary_mask.numpy(),
                                                                markers.numpy())
         post_proc_time = time.time() - post_proc_time
-        print(f"Postproc pass time: {post_proc_time:.2f} seconds")
+        print(f"Watershed proc pass time: {post_proc_time:.2f} seconds")
         
-        print(np.unique(pred_multiclass))
-        
-        pred_multiclass_gpu = torch.from_numpy(pred_multiclass).to(dtype=torch.long, device=device)
-        pred_with_pulp = merge_pulp_into_teeth_torch(pred_multiclass_gpu, pulp_segmentation, pulp_class=50).to(torch.int32) 
-        remapped = remap_labels_torch(pred_with_pulp, pred_to_challange_map)
+        remap_time = time.time()
+        pred_multiclass_gpu = torch.from_numpy(pred_multiclass).to(dtype=torch.long, device=device) 
+        pred_with_pulp = merge_pulp_into_teeth_torch(multiclass_pred.to(device, dtype=torch.long), pulp_segmentation.to(device), pulp_class=46).to(torch.int32)
+        # pred_with_pulp = merge_pulp_into_teeth_torch(pred_multiclass_gpu, pulp_segmentation.to(device), pulp_class=46).to(torch.int32) 
+        remapped = remap_labels_torch(pred_with_pulp, pred_to_challange_map) #change pulp 46 to 50 
             ### invert transforms, eg. padding
             # prediction = transform.post_inference_transform({"pred": MetaTensor(remapped.unsqueeze(0)), "image": data_sample["image"][0]})["pred"] # B,H,W,D
 
+        remap_time = time.time() - remap_time
+        print(f"Remap and merge time: {remap_time:.2f} seconds")
+        
         inference_time = time.time() - start_time
         print(f"Inference time: {inference_time:.2f} seconds")
         
-        #SAVE RESULTS TO DISK TO PREVIEW
-        data_sample['mlt'] = MetaTensor(pred_multiclass_gpu.unsqueeze(0).unsqueeze(0))
-        data_sample['pulp'] = MetaTensor(pulp_segmentation.unsqueeze(0).unsqueeze(0))
-        data_sample['dist'] = MetaTensor(dist_pred.unsqueeze(0).unsqueeze(0))
-        data_sample['final'] = MetaTensor(remapped.unsqueeze(0).unsqueeze(0))
+        #METRICS
+        label_remapped = remap_labels_torch(data_sample['label'].squeeze().to(torch.int32), pred_to_challange_map)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            dice_metric(one_hot(remapped.unsqueeze(0).unsqueeze(0), num_classes=54).float(),
+                        one_hot(label_remapped.unsqueeze(0).unsqueeze(0), num_classes=54).float())
+            hausdorf95(one_hot(remapped.unsqueeze(0).unsqueeze(0), num_classes=54).float(),
+                       one_hot(label_remapped.unsqueeze(0).unsqueeze(0), num_classes=54).float())   
+            dice = dice_metric.aggregate()
+            hd95 = hausdorf95.aggregate()
+
+        dice_no_nan = dice[~torch.isnan(dice)]
+        hd_no_nan = hd95[~torch.isnan(hd95)]
+        print(f"Dice scores: {dice_no_nan}, mean: {dice_no_nan.mean().item():.4f}, std: {dice_no_nan.std().item():.4f}")
+        print(f"HD95 scores: {hd_no_nan}, mean: {hd_no_nan.mean().item():.4f}, std: {hd_no_nan.std().item():.4f}")
         
-        inverted_prediction_mlt = [transform.post_inference_transform_no_dir(i) for i in decollate_batch(data_sample)] 
-        save_transform = SaveMultipleKeysD(
-            keys=['mlt', 'pulp', 'dist', 'final'],
-            output_dir='output/inference_results',
-            output_postfixes=['mlt', 'pulp', 'dist', 'final'],
-            separate_folder=False,
-            output_dtype=[np.uint8, np.uint8, np.float32, np.uint8]
-        )
-        save_transform(inverted_prediction_mlt[0])
+        dice_metric.reset()
+        hausdorf95.reset()
+        torch.cuda.empty_cache()
+        
+        #SAVE RESULTS TO DISK TO PREVIEW
+        # data_sample['mlt'] = MetaTensor(pred_multiclass_gpu.unsqueeze(0).unsqueeze(0))
+        # data_sample['pulp'] = MetaTensor(pulp_segmentation.unsqueeze(0).unsqueeze(0))
+        # data_sample['dist'] = MetaTensor(dist_pred.unsqueeze(0).unsqueeze(0))
+        # data_sample['final'] = MetaTensor(remapped.unsqueeze(0).unsqueeze(0))
+        
+        # inverted_prediction_mlt = [transform.post_inference_transform_no_dir(i) for i in decollate_batch(data_sample)] 
+        # save_transform = SaveMultipleKeysD(
+        #     keys=['mlt', 'pulp', 'dist', 'final'],
+        #     output_dir='output/inference_results',
+        #     output_postfixes=['mlt', 'pulp', 'dist', 'final'],
+        #     separate_folder=False,
+        #     output_dtype=[np.uint8, np.uint8, np.float32, np.uint8]
+        # )
+        # save_transform(inverted_prediction_mlt[0])
         
         #manual save - direct, no inversion, debug inversion
         # save_nifti(pred_multiclass_gpu_clone, path='output', filename="manual_mlt.nii.gz", pixdim=0.2, dtype=np.uint8)

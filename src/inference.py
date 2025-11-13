@@ -77,20 +77,16 @@ def memory_efficient_inference_with_overlap(
 
     with torch.no_grad():
         for s in slices:
-            # Extract patch
-            patch = input_tensor[:, :, s[0], s[1], s[2]]
-
             # Forward pass
-            seg_multiclass, dist, pulp = model(patch)
+            seg_multiclass, dist, pulp = model(input_tensor[:, :, s[0], s[1], s[2]])
 
             # Apply importance map
-            w_patch = importance_map[:, :, :seg_multiclass.shape[2], :seg_multiclass.shape[3], :seg_multiclass.shape[4]]
-            seg_multiclass = torch.softmax(seg_multiclass, dim=1).to(cast_dtype) * w_patch
-            dist = torch.sigmoid(dist).to(cast_dtype) * w_patch
-            pulp = torch.sigmoid(pulp).to(cast_dtype) * w_patch
+            seg_multiclass = torch.softmax(seg_multiclass, dim=1).to(cast_dtype) * importance_map
+            dist = torch.sigmoid(dist).to(cast_dtype) * importance_map
+            pulp = torch.sigmoid(pulp).to(cast_dtype) * importance_map
 
             # Accumulate results
-            sum_weights[:, :, s[0], s[1], s[2]] += w_patch # GPU stored
+            sum_weights[:, :, s[0], s[1], s[2]] += importance_map # GPU stored
             sum_probs[:, :, s[0], s[1], s[2]] += seg_multiclass.cpu()
             dist_output[:, :, s[0], s[1], s[2]] += dist # GPU stored
             pulp_output[:, :, s[0], s[1], s[2]] += pulp # GPU stored
@@ -295,7 +291,7 @@ def main():
     # data_sample = transform.inference_preprocessing(input_image)
     model = DWNet(spatial_dims=3, in_channels=1, out_channels=args.out_channels, act=args.activation, norm=args.norm,
                 bias=False, backbone_name=args.backbone_name, configuration='DIST_PULP')
-    model.load_state_dict(torch.load('checkpoints/checkpoints/silent_pie_5061/model_epoch_380.pth',
+    model.load_state_dict(torch.load('checkpoints/checkpoints/suitable_mastodon_3783/model_epoch_300.pth',
                                     map_location=device, weights_only=True)['model_state_dict'], strict=False)
     model = model.to(device)
     model.eval()
@@ -309,7 +305,7 @@ def main():
         #                                   overlap=0.5, sw_device=device, device='cpu', mode='gaussian', sigma_scale=0.125,
         #                                   padding_mode='constant', cval=0, progress=False)
         # output = memory_efficient_inference(model, data_sample["image"], args.patch_size, device=device) # no overlap - direct aggregation
-        output = memory_efficient_inference_with_overlap(args, model, data_sample['image'], args.patch_size, device=device, overlap=0.5, 
+        output = memory_efficient_inference_with_overlap(args, model, data_sample['image'], args.patch_size, device=device, overlap=0.1, 
                                                          blend_mode="gaussian", sigma_scale=0.125, cast_dtype=torch.float16)
         
         #unpack output

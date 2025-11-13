@@ -45,6 +45,10 @@ original_to_index_map = {
     41: 35, 42: 36, 43: 37, 44: 38, 45: 39, 46: 40, 47: 41, 48: 42,
     103: 43, 104: 44, 105: 45 #nerve canals, 111-148 are pulp labels
 }
+
+original_to_index_with_pulp_map = original_to_index_map.copy()
+original_to_index_with_pulp_map.update({k: 46 for k in range(111, 148 + 1)})
+
 class SaveMultipleKeysD:
     def __init__(self, keys, output_dir, output_postfixes, separate_folder, output_dtype=None):
         self.keys = keys
@@ -161,6 +165,18 @@ class Transforms():
             EnsureTypeD(keys="image", dtype=torch.float16),
             ToDeviceD(keys="image", device=device)
             ]
+
+        self.preprocessing_inference_transforms_with_labels = [
+            LoadImageD(keys=self.keys, reader='NibabelReader'),
+            EnsureChannelFirstD(keys=self.keys),
+            OrientationD(keys=self.keys, axcodes="RAS"),
+            SpacingD(keys=self.keys, pixdim=self.pixdim, mode=self.mode),
+            ScaleIntensityRangeD(keys="image", a_min=0, a_max=args.houndsfield_clip, b_min=0.0, b_max=1.0, clip=True),
+            SpatialPadD(keys=self.keys, spatial_size=args.patch_size, mode="constant", constant_values=0),
+            LambdaD(keys="label", func=partial(remap_labels, mapping=original_to_index_with_pulp_map, channel_id=0)),
+            EnsureTypeD(keys="image", dtype=torch.float16),
+            ToDeviceD(keys=self.keys, device=device)
+            ]
         
         self.pre_collate = [
             RandSpatialCropSamplesD(keys=self.keys, roi_size=args.patch_size, random_size=False, num_samples=args.crop_samples)
@@ -199,6 +215,7 @@ class Transforms():
         self.gpu_transform.set_random_state(seed=args.seed, state=np.random.RandomState(seed=args.seed))
         
         self.inference_transform = Compose(self.preprocessing_transforms)
+        self.inference_transform_with_labels = Compose(self.preprocessing_inference_transforms_with_labels)
 
 
         self.post_pred_train = Compose([Activations(softmax=True, dim=1),

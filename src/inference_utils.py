@@ -21,7 +21,7 @@ pred_to_challange_map = {
     19: 21, 20: 22, 21: 23, 22: 24, 23: 25, 24: 26, 25: 27, 26: 28,
     27: 31, 28: 32, 29: 33, 30: 34, 31: 35, 32: 36, 33: 37, 34: 38,
     35: 41, 36: 42, 37: 43, 38: 44, 39: 45, 40: 46, 41: 47, 42: 48,
-    43: 51, 44: 52, 45: 53, 50: 50 #pulp 50 stays the same
+    43: 51, 44: 52, 45: 53, 46: 50 #pulp 50 stays the same
 }
 
 def save_nifti(array, path, filename, pixdim = 0.4, label_meta_dict=None, affine=None, dtype = np.int16):

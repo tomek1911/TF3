@@ -24,7 +24,7 @@ if general_config['general']['config_source'] == 'cmd':
     print(args_dict)
     print("----------------------------------")
     general_config['args'].update(args_dict)
- 
+
 args = argparse.Namespace(**general_config['args'])
 
 if args.comet:

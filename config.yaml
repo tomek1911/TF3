@@ -137,7 +137,7 @@ args:
     dist_loss: 10.0
     dir_loss: 1.0
     pulp_loss: 1.0
-  nerve_canal_weight: 5.0
+  nerve_canal_weight: 25.0
 
 # --------------------------------------------------
 # Scheduler Settings
