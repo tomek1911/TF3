@@ -41,12 +41,17 @@ dtype_sizes = {
     torch.int64: 8,
 }
 
-def free(tensor):
-    if tensor is not None:
-        tensor = None
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-    return tensor
+# def free(tensor):
+#     if tensor is not None:
+#         tensor = None
+#         torch.cuda.empty_cache()
+#         torch.cuda.synchronize()
+#     return tensor
+
+def free_tensor(t):
+    del t
+    gc.collect()
+    torch.cuda.empty_cache()
 
 def plan_z_slabs(D: int, slab: int):
     """
@@ -584,6 +589,7 @@ def memory_efficient_inference_final(
             # weighted_dist = torch.sigmoid(dist_patch.clamp(-8, 8)).to(dist_map_cast_dtype) * importance_map
             # weighted_pulp = torch.sigmoid(pulp_patch.clamp(-8, 8)).to(cast_dtype) * importance_map
             weighted_probs = torch.softmax(logits, dim=1).to(cast_dtype) * importance_map
+            free_tensor(logits)
             weighted_dist = torch.sigmoid(dist_patch).to(dist_map_cast_dtype) * importance_map
             weighted_pulp = torch.sigmoid(pulp_patch).to(cast_dtype) * importance_map
 
@@ -613,10 +619,8 @@ def memory_efficient_inference_final(
             weights_accumulator[:, :, s[0], s[1], s[2]] += importance_map
             dist_probs[:, :, s[0], s[1], s[2]] += weighted_dist
             pulp_probs[:, :, s[0], s[1], s[2]] += weighted_pulp
-
-            # free GPU/large tensors
-            del logits, weighted_probs, weighted_dist, weighted_pulp
-            torch.cuda.empty_cache()
+            
+            free_tensor(weighted_probs)
 
         # Finished all XY patches for current z0.
         # Compute how many leading slices are now safe to flush.
@@ -634,36 +638,73 @@ def memory_efficient_inference_final(
         flush_end_clamped = min(flush_end, slab_start + pz, D)
         flush_len = flush_end_clamped - slab_start
         if flush_len > 0:
-            # Normalize and argmax on the flushable portion
-            if flush_end_clamped == D:
-                probs_slice = slab_probs  # safe: nothing will be reused
-            else:
-                probs_slice = slab_probs[:, :, :, :, :flush_len].clone() # (1,C,H,W,flush_len)
-            weights_slice = weights_accumulator[:, :, :, :, slab_start: slab_start + flush_len].to('cpu')  # (1,1,H,W,flush_len)
-            # Convert to float32 for stable division if cast_dtype is float16
+            weights_slice = weights_accumulator[:, :, :, :, slab_start: slab_start + flush_len].to('cpu')
+
+            # Compute how many slices from the tail of the patch we must carry forward
+            carry_len = max(0, pz - flush_len)
+
+            # Clone only the part that must be preserved for the next slab (the overlap tail)
+            overlap_backup = None
+            if carry_len > 0 and flush_end_clamped != D:
+                overlap_backup = slab_probs[:, :, :, :, flush_len : flush_len + carry_len].clone()
+
+            # Normalize the full flushable region (we can now safely do this in-place)
             if normalize_to_fp32:
-                probs_slice = (probs_slice.float() / weights_slice.float()).to(cast_dtype)
+                probs_slice = (slab_probs[:, :, :, :, :flush_len].float() / weights_slice.float()).to(cast_dtype)
             else:
-                probs_slice /= weights_slice
-            # argmax -> (1,H,W,flush_len)
-            pred_slice = torch.argmax(probs_slice, dim=1).to(torch.uint8)  # (1,H,W,flush_len)
-            # write to final segmentation map
+                probs_slice = slab_probs[:, :, :, :, :flush_len] / weights_slice  # returns new tensor (no in-place)
+
+            # Argmax to uint8
+            pred_slice = torch.argmax(probs_slice, dim=1).to(torch.uint8)
+
+            # Write predictions to final segmentation
             pred_seg[:, :, :, slab_start: slab_start + flush_len] = pred_slice
 
-            # If this is the last flush to end (flush_end == D), we're done; no need to shift buffer
+            # If this is the final flush, we’re done
             if flush_end_clamped == D:
+                slab_probs.zero_()
                 slab_start += flush_len
                 break
 
-            # Shift remaining slab portion (the overlap) to the front of slab_probs
-            carry_len = max(0, (slab_start + pz) - flush_end_clamped)
+            # Restore the overlap from backup at the beginning of slab buffer
             if carry_len > 0:
-                # Move remaining slice block to the front
-                slab_probs[:, :, :, :, :carry_len] = slab_probs[:, :, :, :, flush_len: flush_len + carry_len]
-                # Zero the tail region to prepare for new incoming contributions
+                slab_probs[:, :, :, :, :carry_len] = overlap_backup
                 slab_probs[:, :, :, :, carry_len:] = 0
+                del overlap_backup
             else:
                 slab_probs.zero_()
+        
+        # if flush_len > 0:
+        #     # Normalize and argmax on the flushable portion
+        #     if flush_end_clamped == D:
+        #         probs_slice = slab_probs  # safe: nothing will be reused
+        #     else:
+        #         probs_slice = slab_probs[:, :, :, :, :flush_len].clone() # (1,C,H,W,flush_len)
+        #     weights_slice = weights_accumulator[:, :, :, :, slab_start: slab_start + flush_len].to('cpu')  # (1,1,H,W,flush_len)
+        #     # Convert to float32 for stable division if cast_dtype is float16
+        #     if normalize_to_fp32:
+        #         probs_slice = (probs_slice.float() / weights_slice.float()).to(cast_dtype)
+        #     else:
+        #         probs_slice /= weights_slice
+        #     # argmax -> (1,H,W,flush_len)
+        #     pred_slice = torch.argmax(probs_slice, dim=1).to(torch.uint8)  # (1,H,W,flush_len)
+        #     # write to final segmentation map
+        #     pred_seg[:, :, :, slab_start: slab_start + flush_len] = pred_slice
+
+        #     # If this is the last flush to end (flush_end == D), we're done; no need to shift buffer
+        #     if flush_end_clamped == D:
+        #         slab_start += flush_len
+        #         break
+
+        #     # Shift remaining slab portion (the overlap) to the front of slab_probs
+        #     carry_len = max(0, (slab_start + pz) - flush_end_clamped)
+        #     if carry_len > 0:
+        #         # Move remaining slice block to the front
+        #         slab_probs[:, :, :, :, :carry_len] = slab_probs[:, :, :, :, flush_len: flush_len + carry_len]
+        #         # Zero the tail region to prepare for new incoming contributions
+        #         slab_probs[:, :, :, :, carry_len:] = 0
+        #     else:
+        #         slab_probs.zero_()
 
             # Advance slab_start by flush_len
             slab_start += flush_len
@@ -844,9 +885,9 @@ def main():
         # {"image": "data/imagesTr/ToothFairy3P_386_0000.nii.gz"},
         # {"image": "data/imagesTr/ToothFairy3P_391_0000.nii.gz"},
         {"image": "data/imagesTr/ToothFairy3S_0001_0000.nii.gz",
-         "label": "data/imagesTr/ToothFairy3S_0001.nii.gz"}, #VAL
+         "label": "data/labelsTr/ToothFairy3S_0001.nii.gz"}, #VAL
         {"image": "data/imagesTr/ToothFairy3S_0014_0000.nii.gz",
-         "label": "data/imagesTr/ToothFairy3S_0014.nii.gz"}, #VAL
+         "label": "data/labelsTr/ToothFairy3S_0014.nii.gz"}, #VAL
         # {"image": "data/imagesTr/ToothFairy3S_0005_0000.nii.gz"},
         # {"image": "data/imagesTr/ToothFairy3S_0010_0000.nii.gz"},
         # {"image": "data/imagesTr/ToothFairy3S_0015_0000.nii.gz"},
@@ -855,10 +896,7 @@ def main():
     dataset = Dataset(data=input_image, transform=transform.inference_transform_with_labels)
     dataloader = DataLoader(dataset, batch_size=1, num_workers=0)
     # data_sample = next(iter(dataloader))
-    
-    dice_metric = DiceMetric(include_background=False, reduction="none", get_not_nans=False, ignore_empty=True)
-    hausdorf95 = HausdorffDistanceMetric(include_background=False, reduction="none", distance_metric='euclidean', percentile=95, get_not_nans=False, directed=False)
-    
+  
     for data_sample in dataloader:
         # data_sample["image"].data = torch.rand(size=(1,1,800,800,400))
         
@@ -887,7 +925,7 @@ def main():
                     multiclass_pred, dist_pred, pulp_segmentation, weights_accumulator = \
                         memory_efficient_inference_final(args, model, data_sample["image"], args.patch_size, device=device, overlap=0.1125, blend_mode="gaussian",
                                                     sigma_scale=0.125, cast_dtype=torch.float16, dist_map_cast_dtype=torch.float16, normalize_to_fp32=False)
-                    model = free(model)
+                    model = free_tensor(model)
                     multiclass_pred = multiclass_pred.squeeze()
                     binary_mask = multiclass_pred.ge(1).to(torch.int8).squeeze().cpu()
                     dist_pred.div_(weights_accumulator) 
@@ -943,8 +981,8 @@ def main():
         
         remap_time = time.time()
         pred_multiclass_gpu = torch.from_numpy(pred_multiclass).to(dtype=torch.long, device=device) 
-        pred_with_pulp = merge_pulp_into_teeth_torch(multiclass_pred.to(device, dtype=torch.long), pulp_segmentation.to(device), pulp_class=46).to(torch.int32)
-        # pred_with_pulp = merge_pulp_into_teeth_torch(pred_multiclass_gpu, pulp_segmentation.to(device), pulp_class=46).to(torch.int32) 
+        # pred_with_pulp = merge_pulp_into_teeth_torch(multiclass_pred.to(device, dtype=torch.long), pulp_segmentation.to(device), pulp_class=46).to(torch.int32)
+        pred_with_pulp = merge_pulp_into_teeth_torch(pred_multiclass_gpu, pulp_segmentation.to(device), pulp_class=46).to(torch.int32) 
         remapped = remap_labels_torch(pred_with_pulp, pred_to_challange_map) #change pulp 46 to 50 
             ### invert transforms, eg. padding
             # prediction = transform.post_inference_transform({"pred": MetaTensor(remapped.unsqueeze(0)), "image": data_sample["image"][0]})["pred"] # B,H,W,D
@@ -957,12 +995,16 @@ def main():
         
         #METRICS
         label_remapped = remap_labels_torch(data_sample['label'].squeeze().to(torch.int32), pred_to_challange_map)
+          
+        dice_metric = DiceMetric(include_background=False, reduction="none", get_not_nans=False, ignore_empty=True)
+        hausdorf95 = HausdorffDistanceMetric(include_background=False, reduction="none", distance_metric='euclidean', percentile=95, get_not_nans=False, directed=False)
+    
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            dice_metric(one_hot(remapped.unsqueeze(0).unsqueeze(0), num_classes=54).float(),
-                        one_hot(label_remapped.unsqueeze(0).unsqueeze(0), num_classes=54).float())
-            hausdorf95(one_hot(remapped.unsqueeze(0).unsqueeze(0), num_classes=54).float(),
-                       one_hot(label_remapped.unsqueeze(0).unsqueeze(0), num_classes=54).float())   
+            pred_oh = one_hot(remapped.unsqueeze(0).unsqueeze(0), num_classes=54).float().to("cuda:1")
+            label_oh = one_hot(label_remapped.unsqueeze(0).unsqueeze(0), num_classes=54).float().to("cuda:1")
+            dice_metric(pred_oh, label_oh)
+            hausdorf95(pred_oh, label_oh)
             dice = dice_metric.aggregate()
             hd95 = hausdorf95.aggregate()
 
@@ -973,6 +1015,8 @@ def main():
         
         dice_metric.reset()
         hausdorf95.reset()
+        del pred_oh, label_oh
+        gc.collect()                
         torch.cuda.empty_cache()
         
         #SAVE RESULTS TO DISK TO PREVIEW
