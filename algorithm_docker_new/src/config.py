@@ -14,5 +14,6 @@ class Args:
     backbone_name: str = "resnet34"
     out_channels: int = 46
     classes: int = 45
-    configuration: str = "DIST_PULP"
+    configuration: str = "PULP"
     inference_autocast_dtype: str = "float16"
+    checkpoint_path: str = "checkpoints/suitable_mastodon_3783/model_epoch_380.pth"

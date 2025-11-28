@@ -89,17 +89,12 @@ class DWNet(nn.Module):
         return self._zero_cache[key]
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        seg_multiclass, edt, edt_direction = (None,)*3
-        B, _, *s_dim = x.shape
-
-        #ENCODER forward
         features = []
         for layer in self.backbone_layers:
             x = layer(x)
             features.append(x)
         features.reverse()
         
-        #DECODER forward
         for level, (layer, feature) in enumerate(zip(self.decoder_blocks, features[1:])):
             if level == 2:
                 seg = self.segmentation_decoder(torch.cat([x, feature], dim=1))
@@ -108,30 +103,24 @@ class DWNet(nn.Module):
             x = layer(x)
         
         seg_multiclass = self.multiclass_decoder(torch.cat([seg, features[-1]], dim=1))
-        dist = self.dist_decoder(torch.cat([x, features[-1]], dim=1)) 
-        pulp = self.pulp_decoder(torch.cat([x, features[-1]], dim=1))
+        dist = self.dist_decoder(torch.cat([x, features[-1]], dim=1)) if self.is_dist else None
+        pulp = self.pulp_decoder(torch.cat([x, features[-1]], dim=1)) if self.is_pulp else None
+        
         if self.training:
-            direction = self.direction_decoder(torch.cat([x, features[-1]], dim=1))
-            direction = f.normalize(direction, p=2.0, dim=1)
+            if self.is_dir:
+                direction = self.direction_decoder(torch.cat([x, features[-1]], dim=1))
+                direction = f.normalize(direction, p=2.0, dim=1)
+            else:
+                direction = None
             return seg_multiclass, dist, direction, pulp
         else:
-            return seg_multiclass, dist, pulp
+            if self.is_dist:
+                return seg_multiclass, dist, pulp #Watershed version
+            else:
+                return seg_multiclass, pulp
         
-        # if self.is_edt:
-        #     edt = self.edt_decoder(torch.cat([x, features[-1]], dim=1))   
-        #     if self.is_dir:
-        #         edt_direction = self.direction_decoder(torch.cat([x, features[-1]], dim=1))
-        #         edt_direction = f.normalize(edt_direction, p=2.0, dim=1, eps=1e-12)
-        #     else:
-        #         edt_direction = self._get_cached_zeros((B, 3, *s_dim), x.device)
-        # else:
-        #     edt = self._get_cached_zeros((B, 1, *s_dim), x.device)
-        #     edt_direction = self._get_cached_zeros((B, 3, *s_dim), x.device)
-
-
         
 if __name__ == "__main__":
-    
     
     import time
     import numpy as np
@@ -151,18 +140,15 @@ if __name__ == "__main__":
                   norm='instance',
                   bias=False,
                   backbone_name=backbone_name,
-                  configuration='DIST_DIR_PULP'
+                  configuration='PULP'
                   ).to(device)
 
     pytorch_total_params = sum(p.numel() for p in model.parameters())
     pytorch_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"trainable paramters: {pytorch_trainable_params/10**6:.2f}M, all parameters: {pytorch_total_params/10**6:.2f}M.")
+    print(f"trainable parameters: {pytorch_trainable_params/10**6:.2f}M, all parameters: {pytorch_total_params/10**6:.2f}M.")
     
-    # a = 128
     batch_size = 1
-    # input = torch.rand(batch_size,1,256,256,160).to(device)
-    # input = torch.rand(1,1,512, 512, 300).to(device)
-    input = torch.rand(batch_size,1,371,362,191).to(device)
+    input = torch.rand(batch_size,1,400,400,200).to(device)
     patch_size = (288,288,160)
     
     print(f"Model input: {input.shape}, patch_size: {patch_size}, encoder name: {backbone_name}, device: {device}.\n")
@@ -175,16 +161,15 @@ if __name__ == "__main__":
     # model.train()
     model.eval()
     start_total = time.time()
-    with torch.no_grad():
+    with torch.inference_mode():
         for i in range(2):
             torch.cuda.synchronize()
             start = time.time()
             # output = model(input)
             with torch.amp.autocast(enabled=True, dtype=torch.float16, device_type=device): 
                 output = sliding_window_inference(input, roi_size=patch_size, sw_batch_size=1, predictor=model, 
-                                        overlap=0.5, sw_device=device, device='cpu', mode='gaussian', sigma_scale=0.125,
+                                        overlap=0.1, sw_device=device, device='cpu', mode='gaussian', sigma_scale=0.125,
                                         padding_mode='constant', cval=0, progress=False)
-            # (1-output[0]).mean().backward()
             torch.cuda.synchronize()
             t = (time.time()-start) * 1000
 

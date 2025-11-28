@@ -40,7 +40,8 @@ done
 echo "Running algorithm Docker container..."
 docker run --rm -it \
     --gpus all \
-    --memory=16g \
+    --memory=32g \
+    -p 5678:5678 \
     -v "$SCRIPTPATH/test/input":/input \
     -v "$SCRIPTPATH/test/output":/output \
     $DOCKER_TAG

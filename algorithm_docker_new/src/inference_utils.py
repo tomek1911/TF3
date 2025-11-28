@@ -213,7 +213,7 @@ def remap_labels_torch(seg_pred: torch.Tensor, mapping_dict: dict) -> torch.Tens
         torch.Tensor with remapped labels, same shape as input.
     """
     max_key = max(mapping_dict.keys())
-    lut = torch.full((max_key + 1,), -1, dtype=torch.int64, device=seg_pred.device)
+    lut = torch.full((max_key + 1,), -1, dtype=torch.int32, device=seg_pred.device)
     for k, v in mapping_dict.items():
         lut[k] = v
     return lut[seg_pred]

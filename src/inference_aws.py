@@ -556,7 +556,7 @@ def memory_efficient_inference_final(
 
     pz = patch_size[2]
     stride_z = scan_interval[2]  # step between z starts as computed by _get_scan_interval
-    overlap_z = max(0, pz - stride_z)
+    # overlap_z = max(0, pz - stride_z)
 
     # (1,1,ph,pw,pz)
     importance_map = compute_importance_map(
@@ -851,6 +851,7 @@ def inference_step(args, model, data_sample, transform, device):
 def main():
 
     is_ram_efficient_inference = True
+    is_watershed_postprocessing = True
 
     config_file = 'config.yaml'
     with open(config_file, 'r') as file:
@@ -898,7 +899,7 @@ def main():
     # data_sample = next(iter(dataloader))
   
     for data_sample in dataloader:
-        # data_sample["image"].data = torch.rand(size=(1,1,800,800,400))
+        data_sample["image"].data = torch.rand(size=(1,1,768,768,393), dtype=torch.float16, device=device)
         
         print(f"Processing image: {data_sample['image'].meta['filename_or_obj'][0]}, shape: {data_sample['image'].shape}")
         # max_voxels = 10*1024**3 // (48 * 2)
@@ -912,7 +913,7 @@ def main():
         #model
         model = DWNet(spatial_dims=3, in_channels=1, out_channels=args.out_channels, act=args.activation, norm=args.norm,
                         bias=False, backbone_name=args.backbone_name, configuration='DIST_PULP')
-        model.load_state_dict(torch.load('checkpoints/checkpoints/suitable_mastodon_3783/model_epoch_300.pth',
+        model.load_state_dict(torch.load('checkpoints/checkpoints/suitable_mastodon_3783/model_epoch_380.pth',
                                         map_location=device, weights_only=True)['model_state_dict'], strict=False)
         model = model.to(device)
         model.eval()
@@ -935,7 +936,7 @@ def main():
                     
                     pulp_segmentation.div_(weights_accumulator) 
                     pulp_segmentation.gt_(0.5) 
-                    pulp_segmentation = pulp_segmentation.to(torch.uint8).squeeze()
+                    pulp_segmentation = pulp_segmentation.to(torch.int8).squeeze()
                     
                     #time
                     network_pass_time = time.time() - start_time
@@ -980,10 +981,12 @@ def main():
         print(f"Watershed proc pass time: {post_proc_time:.2f} seconds")
         
         remap_time = time.time()
-        pred_multiclass_gpu = torch.from_numpy(pred_multiclass).to(dtype=torch.long, device=device) 
-        # pred_with_pulp = merge_pulp_into_teeth_torch(multiclass_pred.to(device, dtype=torch.long), pulp_segmentation.to(device), pulp_class=46).to(torch.int32)
-        pred_with_pulp = merge_pulp_into_teeth_torch(pred_multiclass_gpu, pulp_segmentation.to(device), pulp_class=46).to(torch.int32) 
-        remapped = remap_labels_torch(pred_with_pulp, pred_to_challange_map) #change pulp 46 to 50 
+        if is_watershed_postprocessing:
+            pred_multiclass_gpu = torch.from_numpy(pred_multiclass).to(dtype=torch.int8, device=device) 
+            pred_with_pulp = merge_pulp_into_teeth_torch(pred_multiclass_gpu, pulp_segmentation.to(device), pulp_class=46)
+        else:
+            pred_with_pulp = merge_pulp_into_teeth_torch(multiclass_pred.to(device), pulp_segmentation.to(device), pulp_class=46)
+        remapped = remap_labels_torch(pred_with_pulp.to(torch.int32), pred_to_challange_map)
             ### invert transforms, eg. padding
             # prediction = transform.post_inference_transform({"pred": MetaTensor(remapped.unsqueeze(0)), "image": data_sample["image"][0]})["pred"] # B,H,W,D
 
