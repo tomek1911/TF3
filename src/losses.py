@@ -375,8 +375,14 @@ class FocalDiceBCELoss(nn.Module):
     def __init__(self, alpha=0.5, gamma=1.0, bce_weight=1.0):
         super().__init__()
         self.alpha = alpha
-        self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(bce_weight))
+        self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=self._make_pos_weight(bce_weight))
         self.focal_dice = DiceFocalLoss(sigmoid=True, gamma=gamma)
+
+    @staticmethod
+    def _make_pos_weight(weight):
+        if isinstance(weight, str):
+            weight = float(weight)
+        return torch.tensor(weight, dtype=torch.float32)
 
     def forward(self, logits, target):
         """
@@ -401,8 +407,14 @@ class DiceBCELoss(nn.Module):
     def __init__(self, alpha=0.5, bce_weight=1.0):
         super().__init__()
         self.alpha = alpha
-        self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(bce_weight))
+        self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=self._make_pos_weight(bce_weight))
         self.dice_loss = DiceLoss(sigmoid=True) 
+
+    @staticmethod
+    def _make_pos_weight(weight):
+        if isinstance(weight, str):
+            weight = float(weight)
+        return torch.tensor(weight, dtype=torch.float32)
 
     def forward(self, logits, target):
         """

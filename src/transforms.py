@@ -49,6 +49,26 @@ original_to_index_map = {
 original_to_index_with_pulp_map = original_to_index_map.copy()
 original_to_index_with_pulp_map.update({k: 46 for k in range(111, 148 + 1)})
 
+# All-classes mapping: used when labels come from data/labelsAllClasses/
+# Pulp sentinel value (100) is mapped to class index 46.
+# Teeth keep original FDI IDs before remapping (11-48 -> 11-42).
+# Results in 47 contiguous classes (0-46): bg, anatomy, teeth, canals, merged-pulp.
+original_to_allclass_index_map = {
+    0: 0,   1: 1,  2: 2,  3: 3,  4: 4,  5: 5,  6: 6,  7: 7,  8: 8,  9: 9,  10: 10,
+    11: 11, 12: 12, 13: 13, 14: 14, 15: 15, 16: 16, 17: 17, 18: 18,
+    21: 19, 22: 20, 23: 21, 24: 22, 25: 23, 26: 24, 27: 25, 28: 26,
+    31: 27, 32: 28, 33: 29, 34: 30, 35: 31, 36: 32, 37: 33, 38: 34,
+    41: 35, 42: 36, 43: 37, 44: 38, 45: 39, 46: 40, 47: 41, 48: 42,
+    103: 43, 104: 44, 105: 45,
+    100: 46,  # merged pulp sentinel -> class 46
+}
+
+LABEL_MAPPINGS = {
+    "primary":    original_to_index_map,
+    "with_pulp":  original_to_index_with_pulp_map,
+    "allclasses": original_to_allclass_index_map,
+}
+
 class SaveMultipleKeysD:
     def __init__(self, keys, output_dir, output_postfixes, separate_folder, output_dtype=None):
         self.keys = keys
@@ -144,6 +164,10 @@ class Transforms():
             min_zoom = args.min_zoom
             max_zoom = args.max_zoom
         self.mode = [mode_interpolation_dict[key] for key in self.keys]
+
+        # Select label-value → class-index mapping based on config (default: "primary")
+        label_mapping_name = getattr(args, "label_mapping", "primary")
+        label_mapping = LABEL_MAPPINGS.get(label_mapping_name, original_to_index_map)
         
         self.preprocessing_transforms = [
             LoadImageD(keys=self.keys, reader='NibabelReader'),
@@ -152,7 +176,7 @@ class Transforms():
             SpacingD(keys=self.keys, pixdim=self.pixdim, mode=self.mode),
             ScaleIntensityRangeD(keys="image", a_min=0, a_max=args.houndsfield_clip, b_min=0.0, b_max=1.0, clip=True),
             SpatialPadD(keys=self.keys, spatial_size=args.patch_size, mode="constant", constant_values=0),
-            LambdaD(keys="label", func=partial(remap_labels, mapping=original_to_index_map, channel_id=0))
+            LambdaD(keys="label", func=partial(remap_labels, mapping=label_mapping, channel_id=0))
             ]
         
         self.preprocessing_inference_transforms = [
@@ -247,11 +271,17 @@ class Transforms():
                     )
         
         self.inference_preprocessing = Compose(self.preprocessing_inference_transforms)
-        
+
+        # Build the set of prediction keys to invert based on model configuration
+        _is_pulp = 'PULP' in getattr(args, 'configuration', 'DIST_DIR_PULP')
+        _invert_keys = ['mlt', 'dist', 'dir']
+        if _is_pulp:
+            _invert_keys.insert(1, 'pulp')   # ['mlt', 'pulp', 'dist', 'dir']
+
         self.post_inference_transform = Compose(
                 [
                     InvertD(
-                        keys=['mlt','pulp','dist', 'dir'],  # invert the `pred` data field, also support multiple fields
+                        keys=_invert_keys,  # invert the `pred` data field, also support multiple fields
                         transform= self.inference_preprocessing,
                         orig_keys="image",  # get the previously applied pre_transforms information on the `img` data field,
                         # then invert `pred` based on this information. we can use same info

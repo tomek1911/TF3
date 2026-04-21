@@ -137,16 +137,16 @@ args:
     dist_loss: 10.0
     dir_loss: 1.0
     pulp_loss: 1.0
-  nerve_canal_weight: 25.0
+  nerve_canal_weight: 10.0
 
 # --------------------------------------------------
 # Scheduler Settings
 # --------------------------------------------------
-  scheduler_name: warmup_cosine #Options: cosine_annealing, warmup_cosine, warmup_cosine_restarts
+  scheduler_name: cosine #Options: cosine_annealing, warmup_cosine, warmup_cosine_restarts
   warmup_steps: 0
   first_cycle_steps: 1.0    
   scheduler_gamma: 0.5
-  min_lr: 5.0e-5
+  min_lr: 1.0e-6
 
 # --------------------------------------------------
 # Loss & Metrics

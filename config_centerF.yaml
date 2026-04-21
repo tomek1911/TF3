@@ -1,0 +1,111 @@
+# ============================================================
+#  Center-F override configuration
+# ============================================================
+#
+#  Usage:
+#    python train.py --config_override config_centerF.yaml
+#
+#  This file is overlaid on top of config.yaml.
+#  Only the keys listed here are changed; everything else
+#  inherits from config.yaml.
+#
+#  Purpose: train a CBCT segmentation model on full-FOV center-F
+#  scans only (63 cases).  All anatomical classes (teeth + pulp
+#  merged into class 46) are handled by a single multiclass head;
+#  there is no separate pulp binary head.
+#
+#  Label source : data/labelsAllClasses/
+#  Map source   : data/deep_watershed_maps_allclasses/distdir_maps/
+#
+#  Pre-requisites (run once before training):
+#    1. python src/label_preprocessing_all_classes.py --center F
+#    2. python src/generate_watershed_maps_centerF.py
+#  Recaculate class weights:
+#       python src/generate_class_weights.py --mode presence --label-dir data/labelsAllClasses --output-json data/class_distribution_allclasses.json --output-npy data/class_invfreq_weights.npy --exclude-background
+# ============================================================
+
+args:
+
+  # --------------------------------------------------
+  # Data
+  # --------------------------------------------------
+  labels_folder: labelsAllClasses
+  watershed_maps_folder: deep_watershed_maps_allclasses/distdir_maps
+  watershed_maps_source_labels: data/labelsAllClasses
+  create_preproc_cache: True
+
+  # Restrict training and validation to center F only
+  center_filter:
+    - F
+
+  # With only 63 F-scans, keep a modest val set
+  val_items: 6
+
+  # Label remapping scheme matching labelsAllClasses/ (pulp sentinel 100 → class 46)
+  label_mapping: allclasses
+
+  # --------------------------------------------------
+  # Patch size & resolution
+  # --------------------------------------------------
+  patch_size:
+    - 256
+    - 256
+    - 128
+
+  pixdim: 0.3
+
+  # --------------------------------------------------
+  # Model
+  # --------------------------------------------------
+  # 47 output channels: 0=bg, 1-10=anatomy, 11-42=teeth,
+  #                     43-45=canals, 46=merged pulp
+  out_channels: 47
+  classes: 46
+  configuration: DIST_DIR   # no separate pulp binary head
+
+  # --------------------------------------------------
+  # Checkpointing – separate folder from main run
+  # --------------------------------------------------
+  checkpoint_dir: checkpoints_centerF
+  experiment_dir: output/comet_nii_logs_centerF
+
+  # --------------------------------------------------
+  # Losses  (no pulp_loss; weights must cover only these)
+  # --------------------------------------------------
+  loss_names:
+    - multiclass_seg_loss
+    - dist_loss
+    - dir_loss
+
+  loss_weights:
+    multiclass_seg_loss: 0.1
+    dist_loss: 10.0
+    dir_loss: 1.0
+
+  # --------------------------------------------------
+  # Class weighting
+  # NOTE: recalculate class_invfreq_weights for the new
+  # 47-class labelling before enabling this.
+  # Until then keep 'none' to avoid a shape mismatch.
+  # --------------------------------------------------
+  weighting_mode: inverse_frequency_class_weights
+
+  # --------------------------------------------------
+  # Cache – use a separate cache dir to avoid mixing
+  # with the full-dataset cache
+  # --------------------------------------------------
+  cache_dir: /mnt/vdb1/storage/tsz/data/tf3/cache_centerF
+
+  # --------------------------------------------------
+  # Training schedule
+  # --------------------------------------------------
+  epochs: 400
+  batch_size: 2
+  validation_interval: 20
+  save_interval: 20
+  save_optimiser_interval: 80
+
+  # --------------------------------------------------
+  # Logging / qualitative output
+  # --------------------------------------------------
+  log_slice_2d_interval: 10

@@ -43,10 +43,16 @@ def split_train_val(args):
     Split filenames in args.data directory into train and val sets.
     Select `args.val_items` files per device for validation.
     Returns two lists of filenames.
+
+    Optional args attribute:
+        center_filter (list[str] | None): if set, only include files from
+            those acquisition-center letters, e.g. ['F'] or ['F', 'P'].
     """
     images_dir = os.path.join(args.data, args.images_folder)
     labels_dir = os.path.join(args.data, args.labels_folder)
     watershed_dir = os.path.join(args.data, args.watershed_maps_folder)
+
+    center_filter = getattr(args, "center_filter", None)  # e.g. ['F'] or None
 
     device_files = defaultdict(list)
     # List image files only
@@ -54,6 +60,9 @@ def split_train_val(args):
     for fname in all_files:
         try:
             device = extract_device(fname)
+            # Skip centers not in the allow-list when filtering is active
+            if center_filter is not None and device not in center_filter:
+                continue
             device_files[device].append(fname)
         except ValueError:
             continue

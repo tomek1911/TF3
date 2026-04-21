@@ -8,7 +8,19 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 config_file = 'config.yaml'
 with open(config_file, 'r') as file:
     general_config = yaml.safe_load(file)
-    
+
+# Support --config_override <path> to overlay a secondary YAML onto the main config.
+# This is parsed before the rest of the args so overrides are always applied.
+_pre_parser = argparse.ArgumentParser(add_help=False)
+_pre_parser.add_argument('--config_override', default=None, type=str,
+                          help="Path to a YAML file whose 'args' section overrides config.yaml")
+_pre_args, _ = _pre_parser.parse_known_args()
+if _pre_args.config_override:
+    print(f" *** Applying config override from: {_pre_args.config_override} ***")
+    with open(_pre_args.config_override, 'r') as _f:
+        _override = yaml.safe_load(_f)
+    general_config['args'].update(_override.get('args', {}))
+
 #command line arguments - update config.yaml 
 if general_config['general']['config_source'] == 'cmd':
     print(" *** Applying configuration from commandline experiment parameters ***")
@@ -210,6 +222,7 @@ def setup_training(args):
 
 def training_step(args, losses, batch_idx, epoch, model, optimizer, scaler, data_sample, train_loader,
                   autocast_d_type, device, pbar, metrics_helper, log_helper):
+    has_pulp = 'pulp_loss' in losses
     with torch.amp.autocast(enabled=args.use_scaler, dtype=autocast_d_type, device_type=device.type):
         output = model(data_sample["image"])
         # unpack output
@@ -220,11 +233,12 @@ def training_step(args, losses, batch_idx, epoch, model, optimizer, scaler, data
         total_multiclass_loss = multiclass_dice_loss + ce_loss
         dist_loss = losses['dist_loss'](torch.sigmoid(dist), data_sample["watershed_map"][:,0:1])
         dir_loss = losses['dir_loss'](direction, data_sample["watershed_map"][:,1:], torch.where(data_sample["label"][:,0:1].long() >= 1, 1, 0)) # we binarize distance as mask
-        pulp_loss = losses['pulp_loss'](pulp, data_sample["label"][:,1:])  #pulp labels
         loss =  total_multiclass_loss * args.loss_weights['multiclass_seg_loss'] + \
                 dist_loss * args.loss_weights['dist_loss'] + \
-                dir_loss *  args.loss_weights['dir_loss'] + \
-                pulp_loss * args.loss_weights['pulp_loss']
+                dir_loss *  args.loss_weights['dir_loss']
+        if has_pulp:
+            pulp_loss = losses['pulp_loss'](pulp, data_sample["label"][:,1:])  #pulp labels
+            loss = loss + pulp_loss * args.loss_weights['pulp_loss']
 
         if args.use_scaler and scaler is not None:
             scaler.scale(loss).backward()
@@ -241,11 +255,15 @@ def training_step(args, losses, batch_idx, epoch, model, optimizer, scaler, data
         optimizer.zero_grad(set_to_none=True)
         
         # update metrics - binary seg (pulp), multiclass seg (teeth and misc), distance map prob
-        outputs = (pulp, seg_multiclass, dist)
-        labels = (data_sample["label"][:,1:], data_sample["label"][:,0:1], data_sample["watershed_map"][:,0:1])
+        pulp_out = pulp if has_pulp else None
+        pulp_lbl = data_sample["label"][:,1:] if has_pulp else None
+        outputs = (pulp_out, seg_multiclass, dist)
+        labels = (pulp_lbl, data_sample["label"][:,0:1], data_sample["watershed_map"][:,0:1])
         metrics_helper.update(outputs, labels, epoch)
 
-        loss_values = [total_multiclass_loss, dist_loss, dir_loss, pulp_loss]
+        loss_values = [total_multiclass_loss, dist_loss, dir_loss]
+        if has_pulp:
+            loss_values.append(pulp_loss)
         loss_dict = dict(zip(args.loss_names, loss_values))
         # update losses
         log_helper.update_losses(loss_dict)
@@ -261,21 +279,33 @@ def inference_step(args, batch_idx, epoch, model, scaler, data_sample, data_load
     
         #metrics
         (seg_multiclass, dist, direction, pulp) = output
-        outputs = (pulp, seg_multiclass, dist)
-        labels = (data_sample["label"][:,1:], data_sample["label"][:,0:1], data_sample["watershed_map"][:,0:1])
+        has_pulp_inf = pulp is not None
+        pulp_out_inf = pulp if has_pulp_inf else None
+        pulp_lbl_inf = data_sample["label"][:,1:] if has_pulp_inf else None
+        outputs = (pulp_out_inf, seg_multiclass, dist)
+        labels = (pulp_lbl_inf, data_sample["label"][:,0:1], data_sample["watershed_map"][:,0:1])
         metric_helper.update(outputs, labels, epoch)
 
         #predictions to file save
         if batch_idx % 14 == 0: #will save 3 files: 0('f), 14('p') and 28('s)
             multiclass_segmentation = seg_multiclass.argmax(dim=1, keepdim=True)
-            pulp_segmentation = (torch.sigmoid(pulp) > 0.5).float()
             dist_pred = nn.Threshold(1e-3, 0)(torch.sigmoid(dist))
             
             #store in dict
-            data_sample['pulp'] = pulp_segmentation
             data_sample['dist'] = dist_pred
             data_sample['mlt'] = multiclass_segmentation
             data_sample['dir'] = direction
+
+            save_keys = ['mlt', 'dist', 'dir']
+            save_postfixes = ['mlt', 'dist', 'dir']
+            save_dtypes = [np.uint8, np.float32, np.float32]
+
+            if has_pulp_inf:
+                pulp_segmentation = (torch.sigmoid(pulp) > 0.5).float()
+                data_sample['pulp'] = pulp_segmentation
+                save_keys.insert(1, 'pulp')
+                save_postfixes.insert(1, 'pulp')
+                save_dtypes.insert(1, np.uint8)
             
             # post-process
             inverted_prediction_mlt = [trans.post_inference_transform(i) for i in decollate_batch(data_sample)] 
@@ -286,11 +316,11 @@ def inference_step(args, batch_idx, epoch, model, scaler, data_sample, data_load
 
             # save predictions
             save_transform = SaveMultipleKeysD(
-                keys=['mlt', 'pulp', 'dist', 'dir'],
+                keys=save_keys,
                 output_dir=epoch_dir,
-                output_postfixes=['mlt', 'pulp', 'dist', 'dir'],
+                output_postfixes=save_postfixes,
                 separate_folder=False,
-                output_dtype=[np.uint8, np.uint8, np.float32, np.float32]
+                output_dtype=save_dtypes
             )
             save_transform(inverted_prediction_mlt[0])
         
@@ -415,8 +445,21 @@ def main():
     if args.weighting_mode != 'none':
         if args.weighting_mode == 'inverse_frequency_class_weights':
             invfreq_weights = np.load("data/class_invfreq_weights.npy", allow_pickle=True)
+            if len(invfreq_weights) != args.out_channels:
+                # Weights were generated from raw label values (e.g. 0-105 for allclasses).
+                # Remap them to contiguous class indices using the same mapping as transforms.
+                from src.transforms import LABEL_MAPPINGS
+                label_mapping = LABEL_MAPPINGS.get(getattr(args, 'label_mapping', 'primary'), {})
+                remapped = np.zeros(args.out_channels, dtype=np.float32)
+                for raw_val, class_idx in label_mapping.items():
+                    if class_idx < args.out_channels and raw_val < len(invfreq_weights):
+                        # when multiple raw values map to the same class, take the max weight
+                        remapped[class_idx] = max(remapped[class_idx], float(invfreq_weights[raw_val]))
+                invfreq_weights = remapped
+                print(f"Remapped weight tensor from raw-label space to {args.out_channels} class indices.")
             weights = torch.tensor(invfreq_weights, dtype=torch.float32, device=device)
-            weights[43:46]=args.nerve_canal_weight #high weight for small nerve canals
+            # Boost canal classes (indices 43, 44, 45 in the contiguous class space)
+            weights[43:46] = args.nerve_canal_weight
         else:
             raise NotImplementedError(f"Weighting mode {args.weighting_mode} not implemented.")
         
@@ -427,11 +470,20 @@ def main():
 
     criterion_distance = MSELoss()
     criterion_direction = AngularLoss()
-    # criterion_pulp = FocalDiceBCELoss(alpha=args.focal_alpha, gamma=args.focal_gamma, bce_weight=args.bce_weight)
-    criterion_pulp = DiceBCELoss(alpha=args.focal_alpha, bce_weight=args.bce_weight)
-        
-    criteria = [criterion_seg, criterion_distance, criterion_direction, criterion_pulp]
-    losses = dict(zip(args.loss_names, criteria)) #keep order of loss names!
+
+    criterion_pulp = None
+    if 'pulp_loss' in args.loss_names:
+        criterion_pulp = DiceBCELoss(alpha=args.focal_alpha, bce_weight=args.bce_weight)
+
+    criteria_map = {
+        'multiclass_seg_loss': criterion_seg,
+        'dist_loss': criterion_distance,
+        'dir_loss': criterion_direction,
+    }
+    if criterion_pulp is not None:
+        criteria_map['pulp_loss'] = criterion_pulp
+
+    losses = {name: criteria_map[name] for name in args.loss_names}
     
     #OPTIMIZER
     if args.optimizer == "SGD":
@@ -466,7 +518,8 @@ def main():
         print(f'Loaded model, optimizer and scheduler - continue training from epoch: {args.start_epoch}')
 
     #METRICS
-    metrics_helper = MetricsHelper(args, group_names=["pulp", "multiclass", "distance"])
+    has_pulp_head = 'pulp_loss' in args.loss_names
+    metrics_helper = MetricsHelper(args, group_names=["pulp" if has_pulp_head else "binary", "multiclass", "distance"])
     log_helper = LogHelper(experiment, args)
 
     #Setup print
@@ -489,7 +542,6 @@ def main():
         class_distribution = dict(class_counter)
         with open("data/class_distribution.json", "w") as f:
             json.dump(class_distribution, f, indent=4)
-
         print("Saved class distribution to class_distribution.json")
         
         

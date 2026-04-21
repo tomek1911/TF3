@@ -72,7 +72,7 @@ class MetricsHelper:
 
         with torch.inference_mode(), warnings.catch_warnings(), cp.cuda.Device(int(self.args.metrics_device[-1])):
             warnings.filterwarnings("ignore", category=UserWarning, module="monai.metrics.utils")
-            if epoch % self.args.binary_metrics_interval == 0:
+            if epoch % self.args.binary_metrics_interval == 0 and binary_output is not None and binary_label is not None:
                 b_out = binary_output.detach().to(self.device_metrics, non_blocking=True)
                 b_lab = binary_label.detach().to(self.device_metrics, non_blocking=True)
                 y_pred = (torch.sigmoid(b_out) > 0.5).float().to(self.device_metrics)
