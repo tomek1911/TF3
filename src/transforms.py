@@ -24,7 +24,6 @@ from monai.transforms import (
     RandAffineD,
     RandLambdaD,
     RandRotateD,
-    RandSpatialCropD,
     RandScaleIntensityD,
     RandShiftIntensityD,
     RandSpatialCropSamplesD,
@@ -235,6 +234,7 @@ class Transforms():
         self.pre_collate_transform.set_random_state(seed=args.seed, state=np.random.RandomState(seed=args.seed))
         
         self.cpu_transform = Compose(self.preprocessing_transforms)
+
         self.gpu_transform = Compose(self.geometric_transforms + self.intensity_transforms + self.final_transform, lazy=getattr(args, "lazy_interpolation", False))
         self.gpu_transform.set_random_state(seed=args.seed, state=np.random.RandomState(seed=args.seed))
         
@@ -284,10 +284,8 @@ class Transforms():
                         keys=_invert_keys,  # invert the `pred` data field, also support multiple fields
                         transform= self.inference_preprocessing,
                         orig_keys="image",  # get the previously applied pre_transforms information on the `img` data field,
-                        # then invert `pred` based on this information. we can use same info
-                        # for multiple fields, also support different orig_keys for different fields
-                        nearest_interp=False,  # don't change the interpolation mode to "nearest" when inverting transforms
-                        # to ensure a smooth output, then execute `AsDiscreted` transform
+                        # then invert `pred` based on this information. use nearest-neighbor for discrete labels
+                        nearest_interp=True,
                         to_tensor=True  # convert to PyTorch Tensor after inverting
                     ),
                     # AsDiscreteD(keys="pred", threshold=0.5),

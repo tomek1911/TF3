@@ -32,7 +32,8 @@ args:
   labels_folder: labelsAllClasses
   watershed_maps_folder: deep_watershed_maps_allclasses/distdir_maps
   watershed_maps_source_labels: data/labelsAllClasses
-  create_preproc_cache: True
+  # create_preproc_cache: True
+  # clear_cache: True
 
   # Restrict training and validation to center F only
   center_filter:
@@ -52,7 +53,22 @@ args:
     - 256
     - 128
 
-  pixdim: 0.3
+  # Combine presence + volume distributions via geometric mean
+  presence_weights_json: data/class_distribution_allclasses_presence.json
+  volume_weights_json: data/class_distribution_allclasses_volume.json
+  weighting_combination: geometric_mean
+  weight_log_damping: False
+  weight_fn: median_freq   # gentler than inverse_freq; median class gets weight ~1
+  weight_max: null   
+  weight_min: 0.1
+
+
+  pixdim: 0.6 # to match cbct size from nebla and oral 3d
+  clear_cache: False
+  create_preproc_cache: False
+
+  use_scaler: True
+  autocast_dtype: bfloat16
 
   # --------------------------------------------------
   # Model
@@ -78,7 +94,7 @@ args:
     - dir_loss
 
   loss_weights:
-    multiclass_seg_loss: 0.1
+    multiclass_seg_loss: 0.2 #original 0.1
     dist_loss: 10.0
     dir_loss: 1.0
 
@@ -95,17 +111,20 @@ args:
   # with the full-dataset cache
   # --------------------------------------------------
   cache_dir: /mnt/vdb1/storage/tsz/data/tf3/cache_centerF
+  metrics_device: cuda:0 # cuda:1 is gone :(
 
   # --------------------------------------------------
   # Training schedule
   # --------------------------------------------------
-  epochs: 400
+  epochs: 500
   batch_size: 2
+  multiclass_metrics_firstTime_log: 20
   validation_interval: 20
+  hd95_metrics_interval: 100
   save_interval: 20
-  save_optimiser_interval: 80
+  save_optimiser_interval: 100
 
   # --------------------------------------------------
   # Logging / qualitative output
   # --------------------------------------------------
-  log_slice_2d_interval: 10
+  log_slice_2d_interval: 5

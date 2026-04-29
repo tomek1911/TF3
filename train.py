@@ -5,6 +5,16 @@ import argparse
 from argparse import Namespace
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 #load experiment config
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override into base. Override values win; nested dicts are merged."""
+    result = base.copy()
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
 config_file = 'config.yaml'
 with open(config_file, 'r') as file:
     general_config = yaml.safe_load(file)
@@ -19,7 +29,7 @@ if _pre_args.config_override:
     print(f" *** Applying config override from: {_pre_args.config_override} ***")
     with open(_pre_args.config_override, 'r') as _f:
         _override = yaml.safe_load(_f)
-    general_config['args'].update(_override.get('args', {}))
+    general_config['args'] = _deep_merge(general_config['args'], _override.get('args', {}))
 
 #command line arguments - update config.yaml 
 if general_config['general']['config_source'] == 'cmd':
@@ -75,7 +85,7 @@ from torch.nn import MSELoss
 
 #MONAI modules
 from monai.data import ThreadDataLoader, DataLoader, decollate_batch
-from monai.data.dataset import PersistentDataset, Dataset
+from monai.data.dataset import PersistentDataset, Dataset, CacheDataset
 from monai.transforms import AsDiscrete
 from monai.utils import set_determinism
 from monai.inferers import sliding_window_inference
@@ -269,27 +279,60 @@ def training_step(args, losses, batch_idx, epoch, model, optimizer, scaler, data
         log_helper.update_losses(loss_dict)
         pbar.set_postfix({"loss": f"{log_helper.get_last_loss():.4f}"})
 
+        # 2-D slice previews — first batch of each epoch only
+        if batch_idx == 0:
+            with torch.no_grad():
+                log_helper.log_slices_2d(epoch, seg_multiclass, dist, direction,
+                                         data_sample["label"][:, 0:1],
+                                         data_sample["watershed_map"][:, 0:1],
+                                         data_sample["watershed_map"][:, 1:],
+                                         phase="train")
+
 
 # INFERENCE STEP
 def inference_step(args, batch_idx, epoch, model, scaler, data_sample, data_loader, autocast_d_type, device, pbar, trans, metric_helper, log_helper):
+    has_pulp_inf = 'pulp_loss' in args.loss_names
+
+    def _predictor(x):
+        out = model(x)
+        # sliding_window_inference cannot handle None in the output tuple — strip it
+        return out[:3] if not has_pulp_inf else out
+
     with warnings.catch_warnings(), torch.amp.autocast(enabled=True, dtype=autocast_d_type, device_type=device.type):
-        output = sliding_window_inference(data_sample["image"], roi_size=args.patch_size, sw_batch_size=4, predictor=model, 
+        output = sliding_window_inference(data_sample["image"], roi_size=args.patch_size, sw_batch_size=4, predictor=_predictor, 
                                           overlap=0.5, sw_device=device, device='cpu', mode='gaussian', sigma_scale=0.125,
                                           padding_mode='constant', cval=0, progress=False)
     
         #metrics
-        (seg_multiclass, dist, direction, pulp) = output
-        has_pulp_inf = pulp is not None
-        pulp_out_inf = pulp if has_pulp_inf else None
+        if has_pulp_inf:
+            seg_multiclass, dist, direction, pulp = output
+        else:
+            seg_multiclass, dist, direction = output
+            pulp = None
+        pulp_out_inf = pulp
         pulp_lbl_inf = data_sample["label"][:,1:] if has_pulp_inf else None
         outputs = (pulp_out_inf, seg_multiclass, dist)
         labels = (pulp_lbl_inf, data_sample["label"][:,0:1], data_sample["watershed_map"][:,0:1])
-        metric_helper.update(outputs, labels, epoch)
+        # Pass full-volume spatial shape so MetricsHelper can compute the challenge HD95 diagonal
+        vol_shape = tuple(data_sample["image"].shape[2:])
+        metric_helper.update(outputs, labels, epoch, volume_shape=vol_shape)
+
+        # 2-D slice previews — first batch only
+        if batch_idx == 0:
+            log_helper.log_slices_2d(epoch, seg_multiclass, dist, direction,
+                                     data_sample["label"][:, 0:1],
+                                     data_sample["watershed_map"][:, 0:1],
+                                     data_sample["watershed_map"][:, 1:],
+                                     phase="val")
 
         #predictions to file save
         if batch_idx % 14 == 0: #will save 3 files: 0('f), 14('p') and 28('s)
             multiclass_segmentation = seg_multiclass.argmax(dim=1, keepdim=True)
             dist_pred = nn.Threshold(1e-3, 0)(torch.sigmoid(dist))
+            
+            # mask direction outside the predicted multiclass object mask
+            mask = (multiclass_segmentation > 0).float()
+            direction = direction * mask
             
             #store in dict
             data_sample['dist'] = dist_pred
@@ -379,13 +422,16 @@ def main():
         args.binary_metrics_interval = 5
         args.distance_metrics_interval = 5
         
-        args.log_slice_2d_interval = 1
+        args.log_slice_2d_interval = 5
         args.log_3d_scene_interval_training = 5
         args.log_3d_scene_interval_validation = 5
             
     print("--------------------")
     print (f"\n *** Starting experiment: {unique_experiment_name}:\n")
     print(f"Current server time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    #Setup print
+    disable_tqdm = not sys.stderr.isatty()
     
     #PREPARE DATASETS   
     dataset_json_path = os.path.join(args.data, "dataset.json")
@@ -403,30 +449,70 @@ def main():
         generate_watershed_maps(watershed_files_paths, args.watershed_maps_dir, device="cuda")
 
     trans=Transforms(args, device=device)
-    
+
+    _use_cache = getattr(args, 'use_cache_dataset', False)
     if args.use_persistent_dataset:
         pre_cache_train_dataset = PersistentDataset(data=train_data, transform=trans.preprocessing_transforms, cache_dir=os.path.join(args.cache_path, 'train'))
-        train_transform = trans.train_transform if args.use_thread_loader else trans.preprocessing_transforms
-        train_dataset = PersistentDataset(data=train_data, transform=train_transform, cache_dir=os.path.join(args.cache_path, 'train'))
-        val_dataset = PersistentDataset(data=val_data, transform=trans.inference_transform, cache_dir=os.path.join(args.cache_path, 'val'))
+
+        # Write cache files to disk first (no RAM loading needed for this)
+        if args.create_preproc_cache:
+            pre_cache_loader = DataLoader(pre_cache_train_dataset, num_workers=args.num_workers_cache, batch_size=1, pin_memory=False)
+            start_time_epoch = time.time()
+            # class_counter = Counter()
+            for cache_batch in tqdm(pre_cache_loader, desc=f"Cache persistent dataset", total=len(pre_cache_loader),
+                                   file=sys.stderr, position=1, leave=False, disable=disable_tqdm):
+                continue
+                # labels = cache_batch["label"][:,0:1] #1st-channel is primary labels, no pulp
+                # unique_classes = torch.unique(labels).tolist()
+                # for u in unique_classes:
+                #     class_counter[int(u)] += 1
+            cache_time = time.time() - start_time_epoch
+            print(f"Pre-cache took: {cache_time:.2f}s.")
+
+            # class_distribution = dict(class_counter)
+            # with open("data/class_distribution.json", "w") as f:
+            #     json.dump(class_distribution, f, indent=4)
+            # print("Saved class distribution to class_distribution.json")
+
+        # Set up train/val datasets (optionally load disk cache into RAM)
+        if _use_cache:
+            # Load from existing .pt disk cache files into RAM using parallel workers
+            _val_pd = PersistentDataset(data=val_data, transform=trans.inference_transform, cache_dir=os.path.join(args.cache_path, 'val'))
+            print(f"Loading disk cache into RAM ({len(train_data)} train, {len(val_data)} val)...")
+            _loader_kwargs = dict(batch_size=1, collate_fn=lambda x: x[0], pin_memory=False)
+            _train_ram_loader = DataLoader(pre_cache_train_dataset, num_workers=args.num_workers_cache, **_loader_kwargs)
+            _val_ram_loader   = DataLoader(_val_pd,                  num_workers=args.num_workers_cache, **_loader_kwargs)
+            _cached_train = [s for s in tqdm(_train_ram_loader, desc="Loading train into RAM", file=sys.stderr)]
+            _cached_val   = [s for s in tqdm(_val_ram_loader,   desc="Loading val into RAM",   file=sys.stderr)]
+            train_dataset = Dataset(data=_cached_train)
+            val_dataset   = Dataset(data=_cached_val)
+        else:
+            train_transform = trans.train_transform if args.use_thread_loader else trans.preprocessing_transforms
+            train_dataset = PersistentDataset(data=train_data, transform=train_transform, cache_dir=os.path.join(args.cache_path, 'train'))
+            val_dataset = PersistentDataset(data=val_data, transform=trans.inference_transform, cache_dir=os.path.join(args.cache_path, 'val'))
     else:
+        pre_cache_train_dataset = None
         # Your normal Dataset class expects list of filenames or similar
         train_dataset = Dataset(train_data, transform=trans.train_transform, root_dir=args.data)
         val_dataset = Dataset(val_data, transform=trans.inference_transform, root_dir=args.data)
 
     train_sampler = build_sampler(train_dataset, train_labels, args)
     val_sampler = build_sampler(val_dataset, val_labels, args, split="val")
-    
-    pre_cache_loader = DataLoader(pre_cache_train_dataset, num_workers=args.num_workers_cache, batch_size=1, sampler=train_sampler, pin_memory=False)
-    
+
     if args.use_thread_loader:
         train_loader = ThreadDataLoader(train_dataset, use_thread_workers=True, buffer_size=1, batch_size=args.batch_size, sampler=train_sampler)
         val_loader = ThreadDataLoader(val_dataset, use_thread_workers=True, buffer_size=1, batch_size=args.batch_size_val, sampler=val_sampler)
     else:
-        train_loader = DataLoader(train_dataset, num_workers=args.num_workers, batch_size=args.batch_size, sampler=train_sampler, persistent_workers=True,
-                                  pin_memory=args.pin_memory, worker_init_fn=np.random.seed(args.seed), prefetch_factor=args.prefetch_factor,
-                                  collate_fn=partial(collate_meta_tensor_with_crop, transforms=trans.pre_collate_transform)) #collate after random crop - to enable batches
-        val_loader = DataLoader(val_dataset, num_workers=args.num_workers, batch_size=args.batch_size_val, sampler=val_sampler, pin_memory=False)
+        _in_memory = getattr(args, 'use_cache_dataset', False)
+        _num_workers = 0 if _in_memory else args.num_workers
+        _persistent = False if _in_memory else True
+        _prefetch = None if _in_memory else args.prefetch_factor
+        train_loader = DataLoader(train_dataset, num_workers=_num_workers, batch_size=args.batch_size, sampler=train_sampler,
+                                  persistent_workers=_persistent, pin_memory=args.pin_memory,
+                                  worker_init_fn=None if _in_memory else np.random.seed(args.seed),
+                                  prefetch_factor=_prefetch,
+                                  collate_fn=partial(collate_meta_tensor_with_crop, transforms=trans.pre_collate_transform))
+        val_loader = DataLoader(val_dataset, num_workers=_num_workers, batch_size=args.batch_size_val, sampler=val_sampler, pin_memory=False)
     
     #MODEL
     #num classes = 10 anatomical classes + 32 tooth classes + 3 canal classes + 1 pulp
@@ -443,25 +529,74 @@ def main():
     #LOSSES
     weights = None
     if args.weighting_mode != 'none':
-        if args.weighting_mode == 'inverse_frequency_class_weights':
-            invfreq_weights = np.load("data/class_invfreq_weights.npy", allow_pickle=True)
-            if len(invfreq_weights) != args.out_channels:
-                # Weights were generated from raw label values (e.g. 0-105 for allclasses).
-                # Remap them to contiguous class indices using the same mapping as transforms.
-                from src.transforms import LABEL_MAPPINGS
-                label_mapping = LABEL_MAPPINGS.get(getattr(args, 'label_mapping', 'primary'), {})
-                remapped = np.zeros(args.out_channels, dtype=np.float32)
-                for raw_val, class_idx in label_mapping.items():
-                    if class_idx < args.out_channels and raw_val < len(invfreq_weights):
-                        # when multiple raw values map to the same class, take the max weight
-                        remapped[class_idx] = max(remapped[class_idx], float(invfreq_weights[raw_val]))
-                invfreq_weights = remapped
-                print(f"Remapped weight tensor from raw-label space to {args.out_channels} class indices.")
-            weights = torch.tensor(invfreq_weights, dtype=torch.float32, device=device)
-            # Boost canal classes (indices 43, 44, 45 in the contiguous class space)
-            weights[43:46] = args.nerve_canal_weight
+        from src.generate_class_weights import compute_combined_weights, _raw_inverse_freq
+        from src.transforms import LABEL_MAPPINGS
+
+        label_mapping = LABEL_MAPPINGS.get(getattr(args, 'label_mapping', 'primary'), {})
+        combination    = getattr(args, 'weighting_combination', 'presence_only')
+        weighting_fn   = getattr(args, 'weight_fn', 'inverse_freq')
+        log_damping    = getattr(args, 'weight_log_damping', False)
+        w_max          = getattr(args, 'weight_max', None)
+        w_min          = getattr(args, 'weight_min', None)
+        pres_json      = getattr(args, 'presence_weights_json', None)
+        vol_json       = getattr(args, 'volume_weights_json', None)
+
+        if combination in ('geometric_mean', 'volume_only') and pres_json and vol_json:
+            # Build weights on-the-fly from the two distribution JSONs
+            raw_weights = compute_combined_weights(
+                presence_json=pres_json,
+                volume_json=vol_json,
+                output_npy='data/combined_weights.npy',
+                output_json=None,
+                combination=combination,
+                weighting_fn=weighting_fn,
+                log_damping=log_damping,
+                w_max=w_max,
+                w_min=w_min,
+                exclude_background=False,  # keep bg — min cap handles the floor
+            )
         else:
-            raise NotImplementedError(f"Weighting mode {args.weighting_mode} not implemented.")
+            # Legacy: load presence-only .npy (single distribution JSON via generate_class_weights.py)
+            raw_weights = np.load("data/class_invfreq_weights.npy", allow_pickle=True)
+            if log_damping:
+                raw_weights = np.log1p(raw_weights)
+            if w_max is not None:
+                raw_weights = np.minimum(raw_weights, w_max)
+            if w_min is not None:
+                used = raw_weights > 0
+                raw_weights[used] = np.maximum(raw_weights[used], w_min)
+
+        # Remap from raw label space to contiguous class indices if shapes differ
+        if len(raw_weights) != args.out_channels:
+            remapped = np.zeros(args.out_channels, dtype=np.float32)
+            for raw_val, class_idx in label_mapping.items():
+                if class_idx < args.out_channels and raw_val < len(raw_weights):
+                    remapped[class_idx] = max(remapped[class_idx], float(raw_weights[raw_val]))
+            raw_weights = remapped
+            print(f"Remapped weight tensor from raw-label space to {args.out_channels} class indices.")
+
+        weights = torch.tensor(raw_weights, dtype=torch.float32, device=device)
+
+        # Manual boost for nerve canal classes (indices 43-45) — overrides computed weight
+        if args.nerve_canal_weight is not None:
+            weights[43:46] = args.nerve_canal_weight
+
+        # Manual boost for important classes 9 and 10 — similar config control to the canal override
+        if getattr(args, 'important_classes_weight', None) is not None:
+            important_indices = getattr(args, 'important_classes_indices', [9, 10])
+            for idx in important_indices:
+                if 0 <= idx < args.out_channels:
+                    weights[idx] = args.important_classes_weight
+
+        # Print weight summary for inspection
+        print(f"Class weights [{combination}"
+              f"{', log-damped' if log_damping else ''}"
+              f"{f', cap={w_max}' if w_max is not None else ''}"
+              f"{f', floor={w_min}' if w_min is not None else ''}]:")
+        for i, w in enumerate(weights.cpu().numpy()):
+            if w > 0:
+                print(f"  class {i:02d}: {w:.4f}")
+
         
     if args.seg_loss_name=="DiceCELoss":
         criterion_seg = DiceCELoss(include_background=args.include_background_loss, ce_weight=weights, to_onehot_y=True, softmax=True)
@@ -521,29 +656,6 @@ def main():
     has_pulp_head = 'pulp_loss' in args.loss_names
     metrics_helper = MetricsHelper(args, group_names=["pulp" if has_pulp_head else "binary", "multiclass", "distance"])
     log_helper = LogHelper(experiment, args)
-
-    #Setup print
-    disable_tqdm = not sys.stderr.isatty()
-    
-    if args.create_preproc_cache:
-        start_time_epoch = time.time()
-        class_counter = Counter()
-        for train_data in tqdm(pre_cache_loader, desc=f"Cache persistent dataset", total=len(pre_cache_loader),
-                               file=sys.stderr, position=1, leave=False, disable=disable_tqdm):
-            # continue
-            labels = train_data["label"][:,0:1] #1st-channel is primary labels, no pulp 
-            unique_classes = torch.unique(labels).tolist()
-            for u in unique_classes:
-                class_counter[int(u)] += 1
-
-        cache_time = time.time() - start_time_epoch
-        print(f"Pre-cache took: {cache_time:.2f}s.")
-
-        class_distribution = dict(class_counter)
-        with open("data/class_distribution.json", "w") as f:
-            json.dump(class_distribution, f, indent=4)
-        print("Saved class distribution to class_distribution.json")
-        
         
     experiment.log_parameters(args)
     for epoch in tqdm(range(args.start_epoch, args.epochs+1), desc="Epochs", file=sys.stderr,
@@ -557,12 +669,12 @@ def main():
                     file=sys.stderr, position=1, leave=False, disable=disable_tqdm)
         with use_tqdm_print(args.use_tqdm_print):
             for batch_idx, train_data in pbar:
-                train_data = gpu_transform(train_data, trans, args.use_thread_loader)
+                train_data = gpu_transform(train_data, trans, args.use_thread_loader) #GPU preprocessing
                 training_step(args, losses, batch_idx, epoch, model, optimizer, scaler, train_data, train_loader, 
                                 autocast_d_type, device, pbar, metrics_helper, log_helper)
             metrics_helper.compute(epoch, phase="train")
-            metrics_helper.reset()
             log_helper.log_metrics(epoch, metrics_helper.results, phase="train")
+            metrics_helper.reset()
             log_helper.log_losses(epoch, phase="train")
             log_helper.log_lr(scheduler, epoch)
             scheduler.step()
@@ -586,8 +698,8 @@ def main():
                         inference_step(args, batch_idx, epoch, model, scaler, val_data, val_loader,
                                        val_autocast_d_type, device, pbar, trans, metrics_helper, log_helper)
                 metrics_helper.compute(epoch, phase="val")
-                metrics_helper.reset()
                 log_helper.log_metrics(epoch, metrics_helper.results, phase="val")
+                metrics_helper.reset()
                 val_time=time.time() - start_time_validation
                 print( f"Validation time: {val_time:.2f}s")
                             

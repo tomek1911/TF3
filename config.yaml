@@ -24,7 +24,7 @@ args:
   use_tqdm_print: True
   is_log_qualitative_2d: True
   is_log_qualitative_3d: False
-  log_slice_2d_interval: 10
+  log_slice_2d_interval: 5
   log_3d_scene_training_interval: 20
 
   run_validation : True
@@ -34,20 +34,21 @@ args:
   distance_metrics_interval: 20
   multiclass_metrics_interval: 20
   multiclass_metrics_firstTime_log: 40
-  is_multiclass_one_hot: False
-  metrics_device: cuda:1
+  hd95_metrics_interval: 100
+  is_multiclass_one_hot: True
+  metrics_device: cuda:0
 
 # --------------------------------------------------
 # Device & Parallelism
 # --------------------------------------------------
   device: cuda
-  visible_devices: 0,1
+  visible_devices: 0
   cuda_device_id: 0
   parallel: False
   gpu_frac: 0.99
   num_threads: 16
   pin_memory: True
-  prefetch_factor: 2
+  prefetch_factor: 4
 
 # --------------------------------------------------
 # Data & Preprocessing & Augmentation
@@ -65,7 +66,7 @@ args:
   sampler_type: weighted #weighted, random, sequential
   use_thread_loader: False
   num_workers_cache: 16
-  num_workers: 8
+  num_workers: 12
   use_persistent_dataset: True
   generate_watershed_maps: False
   watershed_maps_source_labels: data/labelsRemapped # Option: data/labelsTr
@@ -80,6 +81,7 @@ args:
     - 288
     - 160
   crop_samples: 1
+  use_cache_dataset: True  # cache all preprocessed data in RAM; faster than disk reads
 
   # Geometric Augmentation
   use_augmentations: True
@@ -101,7 +103,7 @@ args:
   intensity_contrast_prob: 0.75
 
   # Monai & preprocessing
-  lazy_interpolation: True
+  lazy_interpolation: False
 
 # --------------------------------------------------
 # Model Architecture
@@ -137,12 +139,30 @@ args:
     dist_loss: 10.0
     dir_loss: 1.0
     pulp_loss: 1.0
-  nerve_canal_weight: 10.0
+  nerve_canal_weight: null
+  important_classes_weight: 10.0
+  important_classes_indices:
+    - 8
+    - 9
+    - 10
+  # Class weight combination strategy for CE loss.
+  # Options: inverse_frequency_class_weights (presence-only legacy), geometric_mean, volume_only
+  weighting_combination: presence_only   # used when weighting_mode = inverse_frequency_class_weights
+  # Paths to pre-computed distribution JSONs (used by geometric_mean / volume_only)
+  presence_weights_json: data/class_distribution_allclasses_presence.json
+  volume_weights_json: data/class_distribution_allclasses_volume.json
+  # Log-damping: apply log(1+w) before capping — compresses extreme ratios
+  weight_log_damping: False
+  # Weighting function: inverse_freq (aggressive) or median_freq (anchored at median class, gentler)
+  weight_fn: inverse_freq
+  # Hard caps (null = disabled)
+  weight_max: null     # upper cap (e.g. 5.0)
+  weight_min: null     # lower floor for non-background classes (e.g. 0.05)
 
 # --------------------------------------------------
 # Scheduler Settings
 # --------------------------------------------------
-  scheduler_name: cosine #Options: cosine_annealing, warmup_cosine, warmup_cosine_restarts
+  scheduler_name: cosine_annealing #Options: cosine_annealing, warmup_cosine, warmup_cosine_restarts
   warmup_steps: 0
   first_cycle_steps: 1.0    
   scheduler_gamma: 0.5
