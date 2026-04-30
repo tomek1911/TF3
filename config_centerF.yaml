@@ -94,7 +94,7 @@ args:
     - dir_loss
 
   loss_weights:
-    multiclass_seg_loss: 0.2 #original 0.1
+    multiclass_seg_loss: 0.2
     dist_loss: 10.0
     dir_loss: 1.0
 

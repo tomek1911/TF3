@@ -24,7 +24,7 @@ args:
   use_tqdm_print: True
   is_log_qualitative_2d: True
   is_log_qualitative_3d: False
-  log_slice_2d_interval: 5
+  log_slice_2d_interval: 10
   log_3d_scene_training_interval: 20
 
   run_validation : True
@@ -34,21 +34,20 @@ args:
   distance_metrics_interval: 20
   multiclass_metrics_interval: 20
   multiclass_metrics_firstTime_log: 40
-  hd95_metrics_interval: 100
-  is_multiclass_one_hot: True
-  metrics_device: cuda:0
+  is_multiclass_one_hot: False
+  metrics_device: cuda:1
 
 # --------------------------------------------------
 # Device & Parallelism
 # --------------------------------------------------
   device: cuda
-  visible_devices: 0
+  visible_devices: 0,1
   cuda_device_id: 0
   parallel: False
   gpu_frac: 0.99
   num_threads: 16
   pin_memory: True
-  prefetch_factor: 4
+  prefetch_factor: 2
 
 # --------------------------------------------------
 # Data & Preprocessing & Augmentation
@@ -57,7 +56,7 @@ args:
   images_folder: imagesTr
   labels_folder: labelsRemapped # Option: labelsTr 
   watershed_maps_folder: deep_watershed_maps/distdir_maps
-  cache_dir: /mnt/vdb1/storage/tsz/data/tf3/cache
+  cache_dir: data/cache
   experiment_dir: output/comet_nii_logs
   clear_cache: False
   create_preproc_cache: False
@@ -66,7 +65,7 @@ args:
   sampler_type: weighted #weighted, random, sequential
   use_thread_loader: False
   num_workers_cache: 16
-  num_workers: 12
+  num_workers: 8
   use_persistent_dataset: True
   generate_watershed_maps: False
   watershed_maps_source_labels: data/labelsRemapped # Option: data/labelsTr
@@ -77,22 +76,21 @@ args:
   pixdim: 0.3
   houndsfield_clip: 3000
   patch_size: 
-    - 288   
+    - 288
     - 288
     - 160
   crop_samples: 1
-  use_cache_dataset: True  # cache all preprocessed data in RAM; faster than disk reads
 
   # Geometric Augmentation
   use_augmentations: True
   rotation_range_xy: 0.1       # max rotation in radians (~5-6 degrees)
-  rotation_range_z: 0.175     # patients can more easily rotate their head in the axial plane, so allow more rotation around z-axis (max. 10 degrees)
-  rotation_prob: 1.0        # probability to apply rotation
-  scale_range: 0.05          # skip scaling to avoid interpolation artifacts
-  use_anisotropic: False      # anisotropic - same range but different values possible for each axis; isotropic - same scaling factor for all axes in a sample
-  min_zoom: 0.9
-  max_zoom: 1.1
-  zoom_prob: 1.0
+  rotation_range_z: 0.15 
+  rotation_prob: 0.75        # probability to apply rotation
+  scale_range: 0.05           # skip scaling to avoid interpolation artifacts
+  use_anisotropic: True
+  min_zoom: 0.95
+  max_zoom: 1.05
+  zoom_prob: 0.5
 
   # Intensity Augmentation
   intensity_scale: 0.1
@@ -103,7 +101,7 @@ args:
   intensity_contrast_prob: 0.75
 
   # Monai & preprocessing
-  lazy_interpolation: False
+  lazy_interpolation: True
 
 # --------------------------------------------------
 # Model Architecture
@@ -136,45 +134,26 @@ args:
   inference_autocast_dtype: float16
   loss_weights: #loss_weights
     multiclass_seg_loss: 0.1
-    dist_loss: 10.0
-    dir_loss: 1.0
+    dist_loss: 10
+    dir_loss: 1.0e-6
     pulp_loss: 1.0
-  nerve_canal_weight: null
-  important_classes_weight: 10.0
-  important_classes_indices:
-    - 8
-    - 9
-    - 10
-  # Class weight combination strategy for CE loss.
-  # Options: inverse_frequency_class_weights (presence-only legacy), geometric_mean, volume_only
-  weighting_combination: presence_only   # used when weighting_mode = inverse_frequency_class_weights
-  # Paths to pre-computed distribution JSONs (used by geometric_mean / volume_only)
-  presence_weights_json: data/class_distribution_allclasses_presence.json
-  volume_weights_json: data/class_distribution_allclasses_volume.json
-  # Log-damping: apply log(1+w) before capping — compresses extreme ratios
-  weight_log_damping: False
-  # Weighting function: inverse_freq (aggressive) or median_freq (anchored at median class, gentler)
-  weight_fn: inverse_freq
-  # Hard caps (null = disabled)
-  weight_max: null     # upper cap (e.g. 5.0)
-  weight_min: null     # lower floor for non-background classes (e.g. 0.05)
 
 # --------------------------------------------------
 # Scheduler Settings
 # --------------------------------------------------
-  scheduler_name: cosine_annealing #Options: cosine_annealing, warmup_cosine, warmup_cosine_restarts
+  scheduler_name: warmup_cosine #Options: cosine_annealing, warmup_cosine, warmup_cosine_restarts
   warmup_steps: 0
   first_cycle_steps: 1.0    
   scheduler_gamma: 0.5
-  min_lr: 1.0e-6
+  min_lr: 5.0e-5
 
 # --------------------------------------------------
 # Loss & Metrics
 # --------------------------------------------------
   seg_loss_name: DiceCELoss #Options 
   focal_gamma: 0.2
-  focal_alpha: 0.3
-  bce_weight: 1.0e2
+  focal_alpha: 0.5
+  bce_weight: 5
   weighting_mode: inverse_frequency_class_weights #Options: none, inverse_frequency_class_weights
   include_background_loss: True
   include_background_metrics: False
